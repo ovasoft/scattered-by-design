@@ -1,0 +1,24 @@
+# Model weights, caches and large outputs: never commit
+llm_weights/
+hf_cache/
+calib_cache/
+slurm_logs/
+.cache/
+*.pt
+*.bin
+*.safetensors
+.env
+.env.*
+
+# Results: only the small committed sample (see README) is tracked
+results/*
+!results/README.md
+!results/sample/
+figures/
+*.tex
+!paper/*.tex
+
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
