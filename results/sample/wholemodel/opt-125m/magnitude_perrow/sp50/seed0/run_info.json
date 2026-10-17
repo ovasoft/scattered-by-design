@@ -1,0 +1,10 @@
+{
+  "model": "opt-125m",
+  "method": "magnitude_perrow",
+  "sparsity_target": 0.5,
+  "sparsity_achieved": 0.5,
+  "seed": 0,
+  "nsamples": 128,
+  "max_delta_zero_rows": 0.00036892361111111105,
+  "best_transform": "SVD_weighted"
+}

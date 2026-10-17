@@ -1,0 +1,23 @@
+{
+  "model": "llama-7b",
+  "method": "wanda",
+  "sparsity_target": 0.5,
+  "sparsity_achieved": 0.5,
+  "seed": 0,
+  "nsamples": 128,
+  "ppl_wikitext2_pruned": 7.256845474243164,
+  "max_delta_zero_rows": 0.0021554129464285716,
+  "best_transform": "SVD_left",
+  "truncate_oproj": {
+    "layer": "model.layers.1.self_attn.o_proj",
+    "C_out": 4096,
+    "C_in": 4096,
+    "rank_kept": 3478,
+    "rows_deleted": 618,
+    "zero_row_frac": 0.15087890625,
+    "params_dense": 16777216,
+    "params_factored": 28491776,
+    "param_reduction_this_layer": -0.6982421875
+  },
+  "ppl_wikitext2_truncated": 7.256973743438721
+}

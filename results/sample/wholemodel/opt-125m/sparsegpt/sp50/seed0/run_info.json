@@ -1,0 +1,11 @@
+{
+  "model": "opt-125m",
+  "method": "sparsegpt",
+  "sparsity_target": 0.5,
+  "sparsity_achieved": 0.5000078413221571,
+  "seed": 0,
+  "nsamples": 128,
+  "ppl_wikitext2_pruned": 36.97698974609375,
+  "max_delta_zero_rows": 0.0019368489583333334,
+  "best_transform": "Col_sort"
+}

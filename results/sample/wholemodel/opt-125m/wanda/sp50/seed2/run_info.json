@@ -1,0 +1,11 @@
+{
+  "model": "opt-125m",
+  "method": "wanda",
+  "sparsity_target": 0.5,
+  "sparsity_achieved": 0.5,
+  "seed": 2,
+  "nsamples": 128,
+  "ppl_wikitext2_pruned": 39.23405838012695,
+  "max_delta_zero_rows": 0.0033420138888888887,
+  "best_transform": "SVD_weighted"
+}
