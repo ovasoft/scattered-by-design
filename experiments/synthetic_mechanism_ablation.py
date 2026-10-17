@@ -28,20 +28,35 @@ Delta is the paper's marginal-contribution metric:
 
 Zero threshold: the paper uses an absolute 1e-6 on trained weights; synthetic
 scales differ, so we use the scale-equivalent relative threshold
-1e-6 * max|T(W)|.
+1e-6 * max|T(W)| (config.SYNTH_REL_ZERO). The structure metrics are the shared
+definitions from pruning_transforms.metrics, called with that threshold.
+
+The transforms here are numpy versions of a subset of the paper's suite,
+applied to synthetic float64 matrices.
 
 Pure numpy; runs on CPU in well under a minute.
+
+Usage:
+  python experiments/synthetic_mechanism_ablation.py            # all 4 cells + aggregate
+  python experiments/synthetic_mechanism_ablation.py --spectrum flat --rank full   # one cell
+  python experiments/synthetic_mechanism_ablation.py --aggregate  # combine part files
+Outputs (in --out_dir): e5_part_*.csv, synthetic_mechanism_ablation_raw.csv,
+synthetic_mechanism_ablation_summary.csv.
 """
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 import numpy as np
 import pandas as pd
 
+from pruning_transforms.config import (
+    ROW_THRESH, BLOCK_SIZE, BLOCK_THRESH, RANK_THRESHOLDS, SYNTH_REL_ZERO, RESULTS_ROOT)
+from pruning_transforms.metrics import zero_row_frac, zero_col_frac, block_sparsity_frac
+
 N        = 512
 SPARSITY = 0.5
 SEEDS    = [0, 1, 2, 3, 4]
-ROW_THRESH = 0.99
-BLOCK    = 4
-RANK_T   = 1e-3     # rank threshold, anchored to sigma_max(dense)
+RANK_T   = RANK_THRESHOLDS[0]   # 1e-3, anchored to sigma_max(dense)
 
 # ── matrix construction ──────────────────────────────────────────────────────
 def rand_orth(n, rng):
@@ -81,25 +96,24 @@ def make_mask(kind, rng, n=N, sparsity=SPARSITY):
         raise ValueError(kind)
     return M
 
-# ── metrics (paper definitions, relative zero threshold) ─────────────────────
+# ── metrics (paper definitions, RELATIVE zero threshold) ─────────────────────
 def zt_of(W):
-    return 1e-6 * (np.abs(W).max() + 1e-30)
+    """Scale-equivalent zero threshold for synthetic matrices of arbitrary
+    scale: SYNTH_REL_ZERO * max|W| (trained weights use absolute ZERO_THRESH)."""
+    return SYNTH_REL_ZERO * (np.abs(W).max() + 1e-30)
 
 def zero_rows(W):
-    zt = zt_of(W)
-    return float(((np.abs(W) < zt).mean(axis=1) >= ROW_THRESH).mean())
+    return zero_row_frac(W, zt=zt_of(W), rt=ROW_THRESH)
 
 def zero_cols(W):
-    zt = zt_of(W)
-    return float(((np.abs(W) < zt).mean(axis=0) >= ROW_THRESH).mean())
+    return zero_col_frac(W, zt=zt_of(W), rt=ROW_THRESH)
 
-def block4x4(W, bs=BLOCK, thresh=0.9):
-    zt = zt_of(W)
-    nr, nc = W.shape[0] // bs, W.shape[1] // bs
-    blocks = np.abs(W[:nr*bs, :nc*bs]).reshape(nr, bs, nc, bs)
-    return float(((blocks < zt).mean(axis=(1, 3)) >= thresh).mean())
+def block4x4(W, bs=BLOCK_SIZE, thresh=BLOCK_THRESH):
+    return block_sparsity_frac(W, bs=bs, thresh=thresh, zt=zt_of(W))
 
 def mask_corr(M, rng, max_rows=256):
+    """rho(M) on the boolean retain-mask M (True = kept), float64. Always
+    subsamples via rng, unlike the real-model metrics.mask_corr."""
     m = (~M).astype(np.float64)
     idx = rng.choice(m.shape[0], min(max_rows, m.shape[0]), replace=False)
     m = m[idx]
@@ -181,7 +195,10 @@ def main():
     ap.add_argument("--spectrum", choices=["flat", "concentrated"], default=None)
     ap.add_argument("--rank", choices=["full", "half"], default=None)
     ap.add_argument("--aggregate", action="store_true")
+    ap.add_argument("--out_dir", default=str(RESULTS_ROOT / "synthetic"))
     a = ap.parse_args()
+    os.makedirs(a.out_dir, exist_ok=True)
+    out = lambda f: os.path.join(a.out_dir, f)
 
     if not a.aggregate:
         spectra = [a.spectrum] if a.spectrum else ["flat", "concentrated"]
@@ -191,18 +208,18 @@ def main():
             for rank in ranks:
                 print(f"cell {spectrum}/{rank} ...", flush=True)
                 rows += run_cell(spectrum, rank)
-        part = f"e5_part_{'-'.join(spectra)}_{'-'.join(ranks)}.csv"
+        part = out(f"e5_part_{'-'.join(spectra)}_{'-'.join(ranks)}.csv")
         pd.DataFrame(rows).to_csv(part, index=False)
         print(f"wrote {part}")
         if a.spectrum or a.rank:
             return
 
-    parts = sorted(glob.glob("e5_part_*.csv"))
+    parts = sorted(glob.glob(out("e5_part_*.csv")))
     if not parts:
         print("no part files to aggregate"); return
     df = pd.concat([pd.read_csv(p) for p in parts]).drop_duplicates(
         subset=["spectrum", "rank", "mask", "seed"])
-    df.to_csv("synthetic_mechanism_ablation_raw.csv", index=False)
+    df.to_csv(out("synthetic_mechanism_ablation_raw.csv"), index=False)
 
     delta_row_cols = [c for c in df.columns if c.startswith("delta_")
                       and c.endswith("zero_rows")]
@@ -217,7 +234,7 @@ def main():
                 best_delta_rows=("best_delta_rows", "mean"))
            .reset_index()
            .sort_values(["mask", "spectrum", "rank"]))
-    g.to_csv("synthetic_mechanism_ablation_summary.csv", index=False)
+    g.to_csv(out("synthetic_mechanism_ablation_summary.csv"), index=False)
 
     pd.set_option("display.width", 200)
     print(g.round(4).to_string(index=False))

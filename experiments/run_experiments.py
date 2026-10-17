@@ -1,95 +1,73 @@
 """
-Full experiment suite: Wanda zero clustering across OPT and LLaMA model series.
+Per-layer protocol, main sweep: Wanda zero clustering across OPT and LLaMA.
 
-Wanda pruning follows the official implementation exactly:
-  - Uses scaler_row = sqrt(sum of squared activations) per input feature
-  - Per-row comparison group (unstructured)
-  - No weight update
+Each sampled layer is pruned IN ISOLATION. Wanda scalers come from one
+forward pass of the DENSE model (deliberately; this differs from the
+whole-model protocol in run_wholemodel_experiments.py).
 
-Speed fixes applied:
-  - Wanda pruning vectorized (no Python row loop)
-  - Block sparsity vectorized via reshape
-  - SVDs cached per layer
-  - Mask correlation uses dot-product approximation
-  - Calibration tokens cached to disk
+Wanda pruning follows the official implementation:
+  - scaler_row = sqrt(mean over calibration tokens of X_j^2) per input feature
+  - per-row comparison group (unstructured)
+  - no weight update
 
 Claims substantiated:
-  C1: No transform clusters Wanda zeros (Delta=0.0%)
-  C2: QR/SVD zero rows = intrinsic geometry not Wanda
-  C3: Wanda preserves full matrix rank (rank-drop=0)
+  C1: No transform clusters Wanda zeros (Delta = 0.0%)
+  C2: QR/SVD zero rows = intrinsic geometry, not Wanda
+  C3: Wanda preserves matrix rank (rank drop ~ 0 at sigma_max(dense)-anchored thresholds)
   C4: Wanda disperses spectral energy (top-k SV ratio < 1.0)
-  C5: Rows pruned independently (mask correlation ~ 0)
-  C6: rank-drop + SV ratio are diagnostic
-  C7: Findings scale-independent across model sizes
+  C5: Rows are pruned independently (mask correlation ~ 0)
+  C6: Rank drop + SV ratio are diagnostic
+  C7: Findings are scale-independent across model sizes
+
+Outputs (per model, under --results_dir/<model>/):
+  layer_diagnostics.csv, transform_results.csv, sensitivity.csv,
+  transform_failures.csv, summary.json; plus all_models_summary.csv.
 
 Usage:
-  python run_experiments.py --models opt-125m
-  python run_experiments.py --models opt-125m opt-1.3b opt-6.7b opt-13b
-  python run_experiments.py --models llama-7b llama-13b
+  python experiments/run_experiments.py --models opt-125m
+  python experiments/run_experiments.py --models opt-125m opt-1.3b opt-6.7b opt-13b
+  python experiments/run_experiments.py --models llama-7b llama-13b
 """
+import os, sys, json, argparse, warnings
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-import os, json, argparse, warnings
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from scipy import linalg as spla
-from scipy.fft import dct
-from scipy.sparse.csgraph import reverse_cuthill_mckee
-from scipy.sparse import csr_matrix
-from sklearn.decomposition import PCA as skPCA
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from pruning_transforms.config import (
+    MODEL_REGISTRY, LAYER_PATTERNS, N_CALIB, SEQ_LEN, SPARSITY, SV_TOP_KS,
+    N_BINS, MIN_DIM, MAX_C_OUT, RESULTS_ROOT, CALIB_CACHE,
+    get_arch, is_eligible, sampled_blocks)
+from pruning_transforms.metrics import (
+    zero_row_frac, zero_col_frac, near_zero_row_frac, block_sparsity_frac,
+    threshold_sensitivity, qr_theory_zero_rows, rank_at_thresholds,
+    spectral_metrics, mask_corr)
+from pruning_transforms.pruning import (
+    collect_scalers, wanda_prune_gpu, magnitude_prune_global_gpu,
+    magnitude_prune_perrow_gpu, magnitude_prune_hi_gpu)
+from pruning_transforms.transforms import ALL_TRANSFORMS
 warnings.filterwarnings("ignore")
 
-# ── Registry ──────────────────────────────────────────────────────────────────
-MODEL_REGISTRY = {
-    "opt-125m"  : "facebook/opt-125m",
-    "opt-1.3b"  : "facebook/opt-1.3b",
-    "opt-6.7b"  : "facebook/opt-6.7b",
-    "opt-13b"   : "facebook/opt-13b",
-    "llama-7b"  : "huggyllama/llama-7b",
-    "llama-13b" : "huggyllama/llama-13b",
-}
-
-LAYER_PATTERNS = {
-    "opt"  : ["fc1", "fc2", "q_proj", "k_proj", "v_proj", "out_proj"],
-    "llama": ["up_proj", "down_proj", "gate_proj", "q_proj", "k_proj", "v_proj", "o_proj"],
-}
-
-# ── Config ────────────────────────────────────────────────────────────────────
-N_CALIB     = 128
-SEQ_LEN     = 128
-SPARSITY    = 0.5
-ZERO_THRESH = 1e-6
-ROW_THRESH  = 0.99
-BLOCK_SIZE  = 4
-THRESHOLDS  = [1e-3, 1e-4, 1e-6]
-SV_TOP_KS   = [5, 10, 20, 50]
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-RESULTS_DIR = "results"
-CALIB_CACHE = "calib_cache"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--models", nargs="+", default=["opt-125m"],
                     choices=list(MODEL_REGISTRY.keys()))
 parser.add_argument("--sparsity", type=float, default=SPARSITY)
+parser.add_argument("--results_dir", default=str(RESULTS_ROOT / "perlayer"))
+parser.add_argument("--calib_cache", default=str(CALIB_CACHE))
 args = parser.parse_args()
-SPARSITY = args.sparsity
+RESULTS_DIR = args.results_dir
 
-# ── Arch helpers ──────────────────────────────────────────────────────────────
-def get_arch(model_key):
-    return "llama" if "llama" in model_key else "opt"
 
-def is_eligible(name, arch):
-    """All linear layers except embeddings and lm_head."""
-    return (any(p in name for p in LAYER_PATTERNS[arch])
-            and "lm_head" not in name)
-
-# ── Calibration data (cached per tokenizer vocab size) ───────────────────────
+# ── Calibration data (C4 'en' stream, cached per model) ──────────────────────
 def load_calib(tokenizer, model_key):
-    os.makedirs(CALIB_CACHE, exist_ok=True)
-    cache_path = os.path.join(CALIB_CACHE, f"{model_key}.pt")
+    os.makedirs(args.calib_cache, exist_ok=True)
+    cache_path = os.path.join(args.calib_cache, f"{model_key}.pt")
     if os.path.exists(cache_path):
         print(f"  Loading cached calibration tokens from {cache_path}")
         return torch.load(cache_path)
@@ -108,279 +86,9 @@ def load_calib(tokenizer, model_key):
     torch.save(tokens, cache_path)
     return tokens
 
-# ── WrappedLayer: matches official Wanda WrappedGPT exactly ─────────────────────
-class WrappedLayer:
-    """
-    Mirrors official Wanda WrappedGPT exactly.
-    Uses online running mean for numerical stability:
-      scaler_row = mean over batches of ||X_j||_2^2  per input feature j
-    Wanda metric: |W_ij| * sqrt(scaler_row_j)
-    """
-    def __init__(self, layer):
-        self.layer      = layer
-        self.dev        = layer.weight.device
-        self.rows       = layer.weight.data.shape[0]
-        self.columns    = layer.weight.data.shape[1]
-        self.scaler_row = torch.zeros(self.columns, device=self.dev)
-        self.nsamples   = 0
-
-    def add_batch(self, inp, out):
-        if len(inp.shape) == 2:
-            inp = inp.unsqueeze(0)
-        tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear):
-            if len(inp.shape) == 3:
-                inp = inp.reshape((-1, inp.shape[-1]))
-            inp = inp.t()              # (C_in, N*L)
-        # online running mean — matches official WrappedGPT
-        self.scaler_row *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples   += tmp
-        inp = inp.float()
-        self.scaler_row += torch.norm(inp, p=2, dim=1) ** 2 / self.nsamples
-
-    def get_scaler(self):
-        # scaler_row already holds mean squared norm — take sqrt for Wanda metric
-        return torch.sqrt(self.scaler_row)
-# ── Collect activations layer-by-layer (memory efficient) ────────────────────
-def collect_layer_stats(model, calib_tokens, arch):
-    """
-    Returns dict: layer_name -> scaler_row (C_in,) tensor on CPU.
-    Processes one transformer block at a time to avoid OOM.
-    """
-    model.eval()
-    scalers = {}
-
-    if arch == "opt":
-        layers = model.model.decoder.layers
-    else:
-        layers = model.model.layers
-
-    # prepare inputs by running embedding + first hooks
-    # use a simple single-forward hook approach per layer block
-    calib = calib_tokens.to(DEVICE)
-
-    # collect all linear layers in one pass with hooks
-    wrapped = {}
-    handles = []
-
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear): continue
-        if not is_eligible(name, arch): continue
-        w = WrappedLayer(module)
-        wrapped[name] = w
-        def make_hook(wl):
-            def hook(m, inp, out):
-                wl.add_batch(inp[0].detach(), out.detach())
-            return hook
-        handles.append(module.register_forward_hook(make_hook(w)))
-
-    with torch.no_grad():
-        for i in range(0, len(calib), 4):   # mini-batches of 4
-            model(calib[i:i+4])
-
-    for h in handles:
-        h.remove()
-
-    for name, wl in wrapped.items():
-        scalers[name] = wl.get_scaler().cpu()
-
-    return scalers
-
-# ── GPU pruning functions ─────────────────────────────────────────────────────
-def wanda_prune_gpu(W, xn, sparsity=SPARSITY):
-    metric  = W.abs() * xn.reshape(1, -1)
-    n_prune = int(metric.shape[1] * sparsity)
-    _, idx  = torch.topk(metric, n_prune, dim=1, largest=False, sorted=False)
-    Wp = W.clone(); Wp.scatter_(1, idx, 0.0)
-    return Wp
-
-def magnitude_prune_global_gpu(W, sparsity=SPARSITY):
-    k      = int(W.numel() * sparsity)
-    thresh = torch.kthvalue(W.abs().flatten(), k).values
-    Wp     = W.clone(); Wp[Wp.abs() <= thresh] = 0.0
-    return Wp
-
-def magnitude_prune_perrow_gpu(W, sparsity=SPARSITY):
-    n_prune = int(W.shape[1] * sparsity)
-    _, idx  = torch.topk(W.abs(), n_prune, dim=1, largest=False, sorted=False)
-    Wp      = W.clone(); Wp.scatter_(1, idx, 0.0)
-    return Wp
-
-def magnitude_prune_hi_gpu(W, sparsity=0.90):
-    return magnitude_prune_global_gpu(W, sparsity)
-
-RANK_THRESHOLDS = [(1e-3,'1em3'), (1e-4,'1em4'), (1e-5,'1em5'), (1e-6,'1em6')]
-
-def rank_at_thresholds(W, S_dense_max):
-    """
-    Compute rank at multiple thresholds anchored to S_dense_max.
-    Keys are explicit strings: rank_1em3, rank_1em4, rank_1em5, rank_1em6.
-    """
-    try:
-        S = torch.linalg.svdvals(W)
-        return {f"rank_{k}": int((S > S_dense_max * t).sum().item())
-                for t, k in RANK_THRESHOLDS}
-    except Exception:
-        W_np = W.cpu().numpy()
-        S_np = np.linalg.svd(W_np, compute_uv=False)
-        return {f"rank_{k}": int((S_np > S_np[0] * t).sum())
-                for t, k in RANK_THRESHOLDS}
-
-
-
-# ── Metrics (all vectorized) ──────────────────────────────────────────────────
-def zero_row_frac(W, zt=ZERO_THRESH, rt=ROW_THRESH):
-    return float(((np.abs(W) < zt).mean(axis=1) >= rt).mean())
-
-def zero_col_frac(W, zt=ZERO_THRESH, rt=ROW_THRESH):
-    return float(((np.abs(W) < zt).mean(axis=0) >= rt).mean())
-
-def near_zero_row_frac(W, thresh=0.01):
-    norms = np.linalg.norm(W, axis=1)
-    return float((norms < thresh * (norms.mean() + 1e-12)).mean())
-
-def block_sparsity_frac(W, bs=BLOCK_SIZE, thresh=0.9):
-    """Vectorized block sparsity — no Python loops."""
-    C_out, C_in = W.shape
-    nr, nc = C_out // bs, C_in // bs
-    if nr == 0 or nc == 0: return 0.0
-    blocks = (np.abs(W[:nr*bs, :nc*bs])
-              .reshape(nr, bs, nc, bs))
-    zero_frac = (blocks < ZERO_THRESH).mean(axis=(1, 3))   # (nr, nc)
-    return float((zero_frac >= thresh).mean())
-
-
-
-def spectral_metrics(S_dense, S_pruned):
-    """Takes pre-computed singular values (torch tensors on GPU)."""
-    def eff_rank(S):
-        s = S / (S.sum() + 1e-12) + 1e-15
-        return float(torch.exp(-(s * torch.log(s)).sum()).item())
-    out = {
-        "eff_rank_dense" : eff_rank(S_dense),
-        "eff_rank_pruned": eff_rank(S_pruned),
-    }
-    for k in SV_TOP_KS:
-        kk = min(k, S_dense.shape[0], S_pruned.shape[0])
-        out[f"top{k}_ratio"] = float(
-            S_pruned[:kk].sum().item() / (S_dense[:kk].sum().item() + 1e-12))
-    return out
-
-def mask_corr_fast(W_pruned, max_rows=256):
-    """Dot-product based correlation — avoids np.corrcoef on large matrices."""
-    mask = (np.abs(W_pruned) < ZERO_THRESH).astype(np.float32)
-    if mask.shape[0] > max_rows:
-        idx = np.random.choice(mask.shape[0], max_rows, replace=False)
-        mask = mask[idx]
-    mask -= mask.mean(axis=1, keepdims=True)
-    norms = np.linalg.norm(mask, axis=1, keepdims=True) + 1e-12
-    mask /= norms
-    corr = mask @ mask.T
-    off  = corr[np.triu_indices(len(corr), k=1)]
-    return float(np.mean(np.abs(off)))
-
-def threshold_sensitivity(W):
-    return {zt: zero_row_frac(W, zt=zt) for zt in THRESHOLDS}
-
-def qr_theory_zero_rows(C_out, C_in):
-    return float(max(0, C_out - C_in) / C_out)
-
-# GPU-accelerated transforms — take torch tensors, return numpy
-def tg_identity(Wp, xn):    return Wp.cpu().numpy()
-
-def tg_svd_right(Wp, xn):
-    _, _, Vt = torch.linalg.svd(Wp, full_matrices=False)
-    return (Wp @ Vt.T).cpu().numpy()
-
-def tg_svd_left(Wp, xn):
-    U, S, Vt = torch.linalg.svd(Wp, full_matrices=False)
-    return (torch.diag(S) @ Vt).cpu().numpy()
-
-def tg_svd_twosided(Wp, xn):
-    U, S, Vt = torch.linalg.svd(Wp, full_matrices=False)
-    W2 = torch.zeros_like(Wp)
-    k  = S.shape[0]
-    W2[:k, :k] = torch.diag(S)
-    return W2.cpu().numpy()
-
-def tg_svd_weighted(Wp, xn):
-    U, S, Vt = torch.linalg.svd(Wp * xn.reshape(1,-1), full_matrices=False)
-    return (torch.diag(S) @ Vt).cpu().numpy()
-
-def tg_diagonal_scaling(Wp, xn):
-    return (Wp * xn.reshape(1,-1)).cpu().numpy()
-
-def tg_col_sort(Wp, xn):
-    zero_frac = (Wp.abs() < ZERO_THRESH).float().mean(dim=0)
-    idx = torch.argsort(zero_frac, descending=True)
-    return Wp[:, idx].cpu().numpy()
-
-def tg_row_sort(Wp, xn):
-    zero_frac = (Wp.abs() < ZERO_THRESH).float().mean(dim=1)
-    idx = torch.argsort(zero_frac, descending=True)
-    return Wp[idx].cpu().numpy()
-
-def tg_qr_left(Wp, xn):
-    Q, R = torch.linalg.qr(Wp, mode='complete')
-    return R.cpu().numpy()
-
-def tg_hadamard_right(Wp, xn):
-    n = Wp.shape[1]
-    p = int(2**np.ceil(np.log2(n)))
-    H = torch.tensor(spla.hadamard(p, dtype=np.float32)/np.sqrt(p),
-                     device=DEVICE)
-    return (Wp @ H[:n,:n]).cpu().numpy()
-
-def tg_dct_right(Wp, xn):
-    n = Wp.shape[1]
-    Q = torch.tensor(
-        dct(np.eye(n, dtype=np.float32), axis=0, norm='ortho').T,
-        device=DEVICE)
-    return (Wp @ Q).cpu().numpy()
-
-def tg_pca_right(Wp, xn):
-    """PCA rotation of input space. Synthetic X has C_in+10 samples
-    so PCA can return a full-rank (C_in, C_in) rotation matrix."""
-    xn_np    = xn.cpu().numpy()
-    C_in     = len(xn_np)
-    rng      = np.random.default_rng(42)
-    # need n_samples > C_in for full-rank PCA
-    X        = rng.standard_normal((C_in + 10, C_in)).astype(np.float32) * xn_np
-    pca      = skPCA(n_components=C_in)
-    pca.fit(X)
-    Q        = pca.components_.T                     # (C_in, C_in)
-    Q_gpu    = torch.tensor(Q, device=DEVICE)
-    return (Wp @ Q_gpu).cpu().numpy()
-
-def tg_lu_left(Wp, xn):
-    _, _, U = spla.lu(Wp.cpu().numpy()); return U
-
-def tg_cuthill_mckee(Wp, xn):
-    W_np = Wp.cpu().numpy()
-    adj  = csr_matrix((np.abs(W_np) > ZERO_THRESH).astype(np.float32))
-    if adj.shape[0] == adj.shape[1]:
-        return W_np[reverse_cuthill_mckee(adj)]
-    return W_np
-
-TRANSFORMS = {
-    "Identity"        : tg_identity,
-    "PCA_right"       : tg_pca_right,
-    "SVD_right"       : tg_svd_right,
-    "SVD_left"        : tg_svd_left,
-    "SVD_twosided"    : tg_svd_twosided,
-    "QR_left"         : tg_qr_left,
-    "LU_left"         : tg_lu_left,
-    "Hadamard_right"  : tg_hadamard_right,
-    "DCT_right"       : tg_dct_right,
-    "Diagonal_scaling": tg_diagonal_scaling,
-    "Col_sort"        : tg_col_sort,
-    "Row_sort"        : tg_row_sort,
-    "SVD_weighted"    : tg_svd_weighted,
-    "Cuthill_McKee"   : tg_cuthill_mckee,
-}
 
 # ── Per-model run ─────────────────────────────────────────────────────────────
-def run_model(model_key):
+def run_model(model_key, sparsity):
     model_id = MODEL_REGISTRY[model_key]
     arch     = get_arch(model_key)
     out_dir  = os.path.join(RESULTS_DIR, model_key)
@@ -400,95 +108,73 @@ def run_model(model_key):
 
     calib_tokens = load_calib(tokenizer, model_key)
 
+    # Wanda scalers from ONE dense-model pass over all eligible layers,
+    # mini-batches of 4 sequences.
     print("  Collecting activation statistics...")
-    scalers = collect_layer_stats(model, calib_tokens, arch)
+    calib = calib_tokens.to(DEVICE)
+    scalers = collect_scalers(model, [calib[i:i+4] for i in range(0, len(calib), 4)],
+                              keep=lambda n: is_eligible(n, arch))
     print(f"  Got scalers for {len(scalers)} layers")
 
     # keep model on CPU for weight access but clear GPU activations
     model.cpu()
     torch.cuda.empty_cache()
 
-    layer_diag_rows  = []
-    transform_rows   = []
-    sensitivity_rows = []
+    layer_diag_rows    = []
+    transform_rows     = []
+    sensitivity_rows   = []
+    transform_failures = []
 
     # ── 10-bin depth sampling ────────────────────────────────────────────────
-    # Divide model depth into 10 equal bins, sample one block per bin.
-    # Normalised depth = bin_index / 9  in [0, 1] — used as x-axis in figures
-    # so models of different depths are comparable on a single plot.
-    if arch == "opt":
-        n_blocks = len(model.model.decoder.layers)
-    else:
-        n_blocks = len(model.model.layers)
-
-    # one representative block per bin (floor of bin centre)
-    N_BINS = 10
-    bin_edges   = np.linspace(0, n_blocks, N_BINS + 1)
-    sample_indices = []
-    for b in range(N_BINS):
-        centre = int((bin_edges[b] + bin_edges[b+1]) / 2)
-        centre = min(centre, n_blocks - 1)
-        sample_indices.append(centre)
-    sample_indices = sorted(set(sample_indices))   # dedup edge cases
-
-    # map block_index → depth bin — built from same sample_indices
-    block_to_bin = {}
-    for bin_idx, block_idx in enumerate(sample_indices):
-        block_to_bin[block_idx] = bin_idx
-
+    # Normalised depth = bin_index / 9 in [0, 1]: the x-axis in figures, so
+    # models of different depth are comparable on one plot.
+    n_blocks = len(model.model.decoder.layers if arch == "opt" else model.model.layers)
+    sample_indices = sampled_blocks(n_blocks)
+    block_to_bin = {block_idx: bin_idx for bin_idx, block_idx in enumerate(sample_indices)}
     sample_strs = [f"layers.{i}." for i in sample_indices]
     print(f"  n_blocks={n_blocks}  sampled blocks={sample_indices}")
-    print(f"  (10 depth bins, one block per bin)")
+    print(f"  ({N_BINS} depth bins, one block per bin)")
 
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear): continue
         if not is_eligible(name, arch): continue
         if name not in scalers: continue
-        if not any(s in name for s in sample_strs): continue   # ← 10-bin filter
+        if not any(s in name for s in sample_strs): continue   # 10-bin filter
 
         W_tensor  = module.weight.data
         scaler    = scalers[name]
         C_out, C_in = W_tensor.shape
 
-        if C_out < 64 or C_in < 64 or C_out > 16384: continue
+        if C_out < MIN_DIM or C_in < MIN_DIM or C_out > MAX_C_OUT: continue
 
-        # ── Move to GPU for all heavy compute ───────────────────────────────
         W_gpu    = W_tensor.float().to(DEVICE)
         xn_gpu   = scaler.float().to(DEVICE)          # (C_in,)
-        xn_np    = scaler.numpy()
 
-        # synthetic X for PCA (256 samples, column std = xn)
-        rng      = np.random.default_rng(42)
-        X_proxy  = (rng.standard_normal((256, len(xn_np))).astype(np.float32)
-                    * xn_np)
-
-        # ── Pruning on GPU ────────────────────────────────────────────────────
-        W_wanda_gpu  = wanda_prune_gpu(W_gpu, xn_gpu, SPARSITY)
-        W_mag_gpu    = magnitude_prune_global_gpu(W_gpu, SPARSITY)
-        W_mag_pr_gpu = magnitude_prune_perrow_gpu(W_gpu, SPARSITY)
+        # ── Pruning ──────────────────────────────────────────────────────────
+        W_wanda_gpu  = wanda_prune_gpu(W_gpu, xn_gpu, sparsity)
+        W_mag_gpu    = magnitude_prune_global_gpu(W_gpu, sparsity)
+        W_mag_pr_gpu = magnitude_prune_perrow_gpu(W_gpu, sparsity)
         W_hi_gpu     = magnitude_prune_hi_gpu(W_gpu, 0.90)
 
-        # numpy copies for transforms that need numpy
         W_np         = W_gpu.cpu().numpy()
         W_wanda      = W_wanda_gpu.cpu().numpy()
         W_mag_g      = W_mag_gpu.cpu().numpy()
         W_mag_pr     = W_mag_pr_gpu.cpu().numpy()
-        W_hi         = W_hi_gpu.cpu().numpy()
 
-        # ── Cache SVDs on GPU ─────────────────────────────────────────────────
+        # ── SVDs ─────────────────────────────────────────────────────────────
         S_dense  = torch.linalg.svdvals(W_gpu)
         S_wanda  = torch.linalg.svdvals(W_wanda_gpu)
         S_mag    = torch.linalg.svdvals(W_mag_gpu)
         S_hi     = torch.linalg.svdvals(W_hi_gpu)
 
-        # ── Rank at multiple thresholds — all anchored to dense S_max ──────
+        # ── Rank at multiple thresholds, all anchored to dense sigma_max ─────
         S_dense_max = S_dense[0].item()
         ranks_d  = rank_at_thresholds(W_gpu,        S_dense_max)
         ranks_w  = rank_at_thresholds(W_wanda_gpu,  S_dense_max)
         ranks_m  = rank_at_thresholds(W_mag_gpu,    S_dense_max)
         ranks_mp = rank_at_thresholds(W_mag_pr_gpu, S_dense_max)
         ranks_hi = rank_at_thresholds(W_hi_gpu,     S_dense_max)
-        # rank_drop per threshold — negative = spectral redistribution noise
+        # negative drop = spectral redistribution (real; never clamp)
         rank_drops_wanda = {t: ranks_d[t] - ranks_w[t] for t in ranks_d}
         rank_drops_mag   = {t: ranks_d[t] - ranks_m[t] for t in ranks_d}
         rank_drops_hi    = {t: ranks_d[t] - ranks_hi[t] for t in ranks_d}
@@ -497,23 +183,20 @@ def run_model(model_key):
         spec_m   = spectral_metrics(S_dense, S_mag)
         spec_hi  = spectral_metrics(S_dense, S_hi)
 
-        mc_w     = mask_corr_fast(W_wanda)
-        mc_m     = mask_corr_fast(W_mag_g)
-        mc_mp    = mask_corr_fast(W_mag_pr)
+        mc_w     = mask_corr(W_wanda)
+        mc_m     = mask_corr(W_mag_g)
+        mc_mp    = mask_corr(W_mag_pr)
         # random mask control
         W_rand   = W_np.copy()
-        W_rand[np.random.rand(*W_np.shape) < SPARSITY] = 0.0
-        mc_r     = mask_corr_fast(W_rand)
+        W_rand[np.random.rand(*W_np.shape) < sparsity] = 0.0
+        mc_r     = mask_corr(W_rand)
 
         layer_type = next((p for p in LAYER_PATTERNS[arch] if p in name), "other")
-
-        # extract block index from layer name e.g. "model.decoder.layers.5.fc1"
-        block_idx = next(
-            (int(p) for p in name.split(".") if p.isdigit()), 0)
+        block_idx  = next((int(p) for p in name.split(".") if p.isdigit()), 0)
         depth_bin  = block_to_bin.get(block_idx, 0)
-        norm_depth = round(depth_bin / (N_BINS - 1), 4)   # 0.0 … 1.0
+        norm_depth = round(depth_bin / (N_BINS - 1), 4)   # 0.0 ... 1.0
 
-        diag_row = {
+        layer_diag_rows.append({
             "model": model_key, "layer": name,
             "layer_type": layer_type,
             "C_out": C_out, "C_in": C_in,
@@ -544,19 +227,16 @@ def run_model(model_key):
             "mask_corr_random" : mc_r,
             # C2: QR theoretical
             "qr_theory_zero_rows": qr_theory_zero_rows(C_out, C_in),
-        }
-        layer_diag_rows.append(diag_row)
+        })
 
-        # ── Transform loop ────────────────────────────────────────────────────
-        # GPU pruning variants for transform loop
-        gpu_pruning_variants = [
+        # ── Transform loop ───────────────────────────────────────────────────
+        pruning_variants = [
             (W_wanda_gpu,  "wanda"),
             (W_mag_gpu,    "magnitude_global"),
             (W_gpu,        "dense"),
         ]
-
-        for tname, tfn in TRANSFORMS.items():
-            for Wp_gpu, plabel in gpu_pruning_variants:
+        for tname, tfn in ALL_TRANSFORMS.items():
+            for Wp_gpu, plabel in pruning_variants:
                 try:
                     Wt = np.nan_to_num(tfn(Wp_gpu, xn_gpu))
                     transform_rows.append({
@@ -583,8 +263,18 @@ def run_model(model_key):
                                 "transform": tname, "threshold": zt,
                                 "zero_rows": val,
                             })
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Never swallow: a skipped transform is indistinguishable
+                    # from a zero result downstream.
+                    transform_failures.append({
+                        "model": model_key, "layer": name,
+                        "sparsity": sparsity, "transform": tname,
+                        "pruning": plabel, "C_out": C_out, "C_in": C_in,
+                        "error_type": type(e).__name__, "error_msg": str(e),
+                    })
+                    print(f"    [TRANSFORM FAILED] {tname} / {plabel} on "
+                          f"{name} (C_out={C_out}, C_in={C_in}): "
+                          f"{type(e).__name__}: {e}")
 
         drop_str = " | ".join(f"{k}:{v:+d}" for k, v in rank_drops_wanda.items())
         print(f"  ✓ {name:<45} rank_drops=[{drop_str}]  "
@@ -595,20 +285,29 @@ def run_model(model_key):
     df_diag  = pd.DataFrame(layer_diag_rows)
     df_trans = pd.DataFrame(transform_rows)
     df_sens  = pd.DataFrame(sensitivity_rows)
+    df_fail  = pd.DataFrame(transform_failures, columns=[
+        "model", "layer", "sparsity", "transform", "pruning", "C_out", "C_in",
+        "error_type", "error_msg"])
 
     df_diag .to_csv(os.path.join(out_dir, "layer_diagnostics.csv"),  index=False)
     df_trans.to_csv(os.path.join(out_dir, "transform_results.csv"),  index=False)
     df_sens .to_csv(os.path.join(out_dir, "sensitivity.csv"),        index=False)
+    df_fail .to_csv(os.path.join(out_dir, "transform_failures.csv"), index=False)
+
+    if len(df_fail):
+        print(f"\n  WARNING: {len(df_fail)} transform/layer/pruning combinations "
+              f"failed -- see {out_dir}/transform_failures.csv")
+        print(df_fail.groupby("transform").size().sort_values(ascending=False).to_string())
 
     # summary
-    wanda_z = df_trans[df_trans.pruning=="wanda"].groupby("transform")["zero_rows"].mean()
-    dense_z = df_trans[df_trans.pruning=="dense"].groupby("transform")["zero_rows"].mean()
+    wanda_z = df_trans[df_trans["pruning"] == "wanda"].groupby("transform")["zero_rows"].mean()
+    dense_z = df_trans[df_trans["pruning"] == "dense"].groupby("transform")["zero_rows"].mean()
     delta   = (wanda_z - dense_z).to_dict()
 
     summary = {
         "model"               : model_key,
         "n_layers"            : len(layer_diag_rows),
-        "sparsity"            : SPARSITY,
+        "sparsity"            : sparsity,
         "avg_rank_drop_wanda_1em3": float(df_diag["drop_wanda_rank_1em3"].mean()),
         "avg_rank_drop_wanda_1em6": float(df_diag["drop_wanda_rank_1em6"].mean()),
         "avg_rank_drop_mag_1em3"  : float(df_diag["drop_mag_rank_1em3"].mean()),
@@ -623,6 +322,7 @@ def run_model(model_key):
         "max_delta_wanda"     : float(max(delta.values())) if delta else 0.0,
         "best_transform"      : max(delta, key=delta.get) if delta else "n/a",
         "all_delta_zero"      : all(abs(v) < 0.001 for v in delta.values()),
+        "n_transform_failures": int(len(df_fail)),
         "delta_per_transform" : delta,
     }
 
@@ -638,6 +338,7 @@ def run_model(model_key):
     print(f"  max_delta_wanda  = {summary['max_delta_wanda']:+.4f}")
     print(f"  all_delta_zero   = {summary['all_delta_zero']}")
     return summary
+
 
 # ── Cross-model summary ───────────────────────────────────────────────────────
 def save_cross_model_summary(summaries):
@@ -665,14 +366,17 @@ def save_cross_model_summary(summaries):
     print(f"\n{'='*70}\nCROSS-MODEL SUMMARY\n{'='*70}")
     print(df.to_string(index=False))
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    summaries = []
+    summaries, failed = [], []
     for model_key in args.models:
         try:
-            summaries.append(run_model(model_key))
+            summaries.append(run_model(model_key, args.sparsity))
         except Exception as e:
             print(f"\nERROR on {model_key}: {e}")
             import traceback; traceback.print_exc()
+            failed.append(model_key)
     save_cross_model_summary(summaries)
     print("\nDone.")
+    if failed:
+        sys.exit(f"FAILED models: {failed}")

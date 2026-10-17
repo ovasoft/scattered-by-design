@@ -49,32 +49,35 @@ invariance machinery is unnecessary for the sparsity question being asked.
 State this in the rebuttal.
 
 Pruning is whole-model via the official locuslab/wanda code (same as
-run_wholemodel_experiments.py).
+run_wholemodel_experiments.py; vendored in third_party/wanda).
 
 Usage:
-  python run_crosslayer_q.py --wanda_repo ./wanda --models opt-125m \
+  python experiments/run_crosslayer_q.py --models opt-125m \
       --methods wanda sparsegpt --sparsity 0.5 --seed 0 \
       --q_modes global per_block random
 """
 
 import os, sys, json, argparse, warnings, types, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from pruning_transforms.config import (
+    MODEL_REGISTRY, MIN_DIM, MAX_C_OUT, RESULTS_ROOT, DEFAULT_WANDA_REPO,
+    get_arch, is_eligible, sampled_blocks)
+from pruning_transforms.metrics import (
+    zero_row_frac, zero_col_frac, near_zero_row_frac, near_zero_col_frac,
+    block_sparsity_frac)
+from pruning_transforms.pruning import import_official_pruners
 warnings.filterwarnings("ignore")
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-MODEL_REGISTRY = {
-    "opt-125m"  : "facebook/opt-125m",
-    "opt-1.3b"  : "facebook/opt-1.3b",
-    "opt-6.7b"  : "facebook/opt-6.7b",
-    "llama-7b"  : "huggyllama/llama-7b",
-    "llama-13b" : "huggyllama/llama-13b",
-}
 READ_WRITE = {
     "opt": {"read": ["q_proj", "k_proj", "v_proj", "fc1"],
             "write": ["out_proj", "fc2"]},
@@ -82,15 +85,10 @@ READ_WRITE = {
               "write": ["o_proj", "down_proj"]},
 }
 
-ZERO_THRESH = 1e-6
-ROW_THRESH  = 0.99
-BLOCK_SIZE  = 4
-NEAR_ZERO   = 0.01     # slice norm < 1% of mean norm => deletable slice
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-RESULTS_DIR = "results_crosslayer_q"
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--wanda_repo", type=str, required=True)
+parser.add_argument("--wanda_repo", type=str, default=str(DEFAULT_WANDA_REPO))
 parser.add_argument("--models", nargs="+", default=["opt-125m"],
                     choices=list(MODEL_REGISTRY.keys()))
 parser.add_argument("--methods", nargs="+", default=["wanda"],
@@ -105,46 +103,11 @@ parser.add_argument("--q_modes", nargs="+",
                     choices=["global", "per_block", "random"])
 parser.add_argument("--dtype", type=str, default="float32",
                     choices=["float16", "float32"])
+parser.add_argument("--results_dir", default=str(RESULTS_ROOT / "crosslayer_q"))
 args = parser.parse_args()
+RESULTS_DIR = args.results_dir
 
-# ── official-repo import (same shim as run_wholemodel_experiments.py) ────────
-def get_arch(model_key):
-    return "llama" if "llama" in model_key else "opt"
-
-def import_official_pruners(repo_path, arch):
-    repo_path = os.path.abspath(repo_path)
-    if repo_path not in sys.path:
-        sys.path.insert(0, repo_path)
-    from lib.data import get_loaders
-    if arch == "llama":
-        from lib.prune import (prune_wanda, prune_sparsegpt,
-                               prune_magnitude, check_sparsity)
-    else:
-        from lib.prune_opt import (prune_wanda, prune_sparsegpt,
-                                   prune_magnitude, check_sparsity)
-    return prune_wanda, prune_sparsegpt, prune_magnitude, check_sparsity, get_loaders
-
-# ── metrics (paper conventions) ──────────────────────────────────────────────
-def zero_row_frac(W):
-    return float(((np.abs(W) < ZERO_THRESH).mean(axis=1) >= ROW_THRESH).mean())
-
-def zero_col_frac(W):
-    return float(((np.abs(W) < ZERO_THRESH).mean(axis=0) >= ROW_THRESH).mean())
-
-def near_zero_row_frac(W, thresh=NEAR_ZERO):
-    norms = np.linalg.norm(W, axis=1)
-    return float((norms < thresh * (norms.mean() + 1e-12)).mean())
-
-def near_zero_col_frac(W, thresh=NEAR_ZERO):
-    norms = np.linalg.norm(W, axis=0)
-    return float((norms < thresh * (norms.mean() + 1e-12)).mean())
-
-def block_sparsity_frac(W, bs=BLOCK_SIZE, thresh=0.9):
-    nr, nc = W.shape[0] // bs, W.shape[1] // bs
-    if nr == 0 or nc == 0: return 0.0
-    blocks = np.abs(W[:nr*bs, :nc*bs]).reshape(nr, bs, nc, bs)
-    return float(((blocks < ZERO_THRESH).mean(axis=(1, 3)) >= thresh).mean())
-
+# ── metrics (paper conventions, shared definitions) ──────────────────────────
 METRICS = {
     "zero_rows"     : zero_row_frac,
     "zero_cols"     : zero_col_frac,
@@ -222,25 +185,15 @@ def apply_q(W, side, Q):
         if W.shape[0] != Q.shape[0]: return None
         return Q.T @ W
 
-# ── 10-bin depth sampling (manuscript protocol) ──────────────────────────────
-def sampled_blocks(n_blocks, n_bins=10):
-    edges = np.linspace(0, n_blocks, n_bins + 1)
-    return sorted(set(min(int((edges[b] + edges[b+1]) / 2), n_blocks - 1)
-                      for b in range(n_bins)))
-
-def is_eligible(name, arch):
-    pats = READ_WRITE[arch]["read"] + READ_WRITE[arch]["write"]
-    return any(p in name for p in pats) and "lm_head" not in name
-
 # ── main ─────────────────────────────────────────────────────────────────────
 def main():
     for model_key in args.models:
         arch     = get_arch(model_key)
         model_id = MODEL_REGISTRY[model_key]
-        (prune_wanda, prune_sparsegpt, prune_magnitude,
-         check_sparsity, get_loaders) = import_official_pruners(args.wanda_repo, arch)
-        PRUNERS = {"wanda": prune_wanda, "sparsegpt": prune_sparsegpt,
-                   "magnitude": prune_magnitude}
+        off = import_official_pruners(arch, args.wanda_repo)
+        check_sparsity, get_loaders = off["check_sparsity"], off["get_loaders"]
+        PRUNERS = {"wanda": off["prune_wanda"], "sparsegpt": off["prune_sparsegpt"],
+                   "magnitude": off["prune_magnitude"]}
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
 
         for method in args.methods:
@@ -275,7 +228,7 @@ def main():
                     if (isinstance(m, nn.Linear) and is_eligible(name, arch)
                             and any(s in name for s in sample_strs)):
                         C_out, C_in = m.weight.shape
-                        if C_out < 64 or C_in < 64 or C_out > 16384: continue
+                        if C_out < MIN_DIM or C_in < MIN_DIM or C_out > MAX_C_OUT: continue
                         dense_snapshots[name] = m.weight.data.detach().clone().cpu()
                 print(f"  snapshot: {len(dense_snapshots)} sampled layers "
                       f"(blocks {blocks})", flush=True)
@@ -347,11 +300,11 @@ def main():
 
                 # 5. Delta per (q_mode, metric)
                 summary = {}
-                for qmode in df.q_mode.unique():
-                    sub = df[df.q_mode == qmode]
-                    pruned = sub[sub.pruning == method].groupby("layer")[
+                for qmode in df["q_mode"].unique():
+                    sub = df[df["q_mode"] == qmode]
+                    pruned = sub[sub["pruning"] == method].groupby("layer")[
                         list(METRICS)].mean()
-                    dense  = sub[sub.pruning == "dense"].groupby("layer")[
+                    dense  = sub[sub["pruning"] == "dense"].groupby("layer")[
                         list(METRICS)].mean()
                     delta  = (pruned - dense)
                     summary[qmode] = {

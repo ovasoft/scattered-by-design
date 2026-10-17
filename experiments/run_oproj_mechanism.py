@@ -40,48 +40,49 @@ a targeted analysis of ~4 small matrices per block):
   Shape is controlled by construction: q_proj has the identical (d, d) shape
   as o_proj at every depth, so any o_proj/q_proj difference cannot be shape.
 
-Pruning is whole-model via the official locuslab/wanda code.
+Pruning is whole-model via the official locuslab/wanda code (vendored in
+third_party/wanda). Activation scalers come from the DENSE model on the first
+32 calibration sequences.
 
 Usage:
-  python run_oproj_mechanism.py --wanda_repo ./wanda \
+  python experiments/run_oproj_mechanism.py \
       --models opt-125m --methods wanda sparsegpt --sparsity 0.5
   # llama-7b for the +10.5% anomaly layer itself:
-  python run_oproj_mechanism.py --wanda_repo ./wanda \
+  python experiments/run_oproj_mechanism.py \
       --models llama-7b --methods wanda --sparsity 0.5 --dtype float16
 """
 
 import os, sys, json, argparse, warnings, types, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from pruning_transforms.config import (
+    MODEL_REGISTRY, ZERO_THRESH, ROW_THRESH, RESULTS_ROOT, DEFAULT_WANDA_REPO,
+    get_arch)
+from pruning_transforms.metrics import mask_corr, zero_row_frac
+from pruning_transforms.pruning import collect_scalers, import_official_pruners
+from pruning_transforms.transforms import tg_svd_left
 warnings.filterwarnings("ignore")
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-MODEL_REGISTRY = {
-    "opt-125m"  : "facebook/opt-125m",
-    "opt-1.3b"  : "facebook/opt-1.3b",
-    "opt-6.7b"  : "facebook/opt-6.7b",
-    "llama-7b"  : "huggyllama/llama-7b",
-    "llama-13b" : "huggyllama/llama-13b",
-}
 TARGETS = {
     # layer_type -> role in the analysis
     "opt":   {"out_proj": "target", "q_proj": "shape_control", "fc2": "write_control"},
     "llama": {"o_proj":   "target", "q_proj": "shape_control", "down_proj": "write_control"},
 }
 
-ZERO_THRESH = 1e-6
-ROW_THRESH  = 0.99
-RANK_THRESHOLDS = [(1e-3, "1em3"), (1e-6, "1em6")]
+RANK_THRESHOLDS = [(1e-3, "1em3"), (1e-6, "1em6")]   # subset of config.RANK_THRESHOLDS
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-RESULTS_DIR = "results_oproj_mechanism"
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--wanda_repo", type=str, required=True)
+parser.add_argument("--wanda_repo", type=str, default=str(DEFAULT_WANDA_REPO))
 parser.add_argument("--models", nargs="+", default=["opt-125m"],
                     choices=list(MODEL_REGISTRY.keys()))
 parser.add_argument("--methods", nargs="+", default=["wanda"],
@@ -91,41 +92,9 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--nsamples", type=int, default=128)
 parser.add_argument("--dtype", type=str, default="float32",
                     choices=["float16", "float32"])
+parser.add_argument("--results_dir", default=str(RESULTS_ROOT / "oproj_mechanism"))
 args = parser.parse_args()
-
-def get_arch(model_key):
-    return "llama" if "llama" in model_key else "opt"
-
-def import_official_pruners(repo_path, arch):
-    repo_path = os.path.abspath(repo_path)
-    if repo_path not in sys.path:
-        sys.path.insert(0, repo_path)
-    from lib.data import get_loaders
-    if arch == "llama":
-        from lib.prune import (prune_wanda, prune_sparsegpt,
-                               prune_magnitude, check_sparsity)
-    else:
-        from lib.prune_opt import (prune_wanda, prune_sparsegpt,
-                                   prune_magnitude, check_sparsity)
-    return prune_wanda, prune_sparsegpt, prune_magnitude, check_sparsity, get_loaders
-
-# ── Wanda-style scaler collection on the dense model ─────────────────────────
-class WrappedLayer:
-    def __init__(self, layer):
-        self.scaler_row = torch.zeros(layer.weight.data.shape[1],
-                                      device=layer.weight.device)
-        self.nsamples = 0
-    def add_batch(self, inp):
-        if len(inp.shape) == 2: inp = inp.unsqueeze(0)
-        tmp = inp.shape[0]
-        if len(inp.shape) == 3: inp = inp.reshape((-1, inp.shape[-1]))
-        inp = inp.t()
-        self.scaler_row *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples   += tmp
-        inp = inp.float()
-        self.scaler_row += torch.norm(inp, p=2, dim=1) ** 2 / self.nsamples
-    def get_scaler(self):
-        return torch.sqrt(self.scaler_row)
+RESULTS_DIR = args.results_dir
 
 def layer_role(name, arch):
     for pat, role in TARGETS[arch].items():
@@ -133,34 +102,7 @@ def layer_role(name, arch):
             return pat, role
     return None, None
 
-def collect_scalers(model, arch, calib_batches):
-    wrapped, handles = {}, []
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear): continue
-        pat, role = layer_role(name, arch)
-        if pat is None: continue
-        wl = WrappedLayer(module); wrapped[name] = wl
-        def make_hook(w):
-            def hook(m, inp, out): w.add_batch(inp[0].detach())
-            return hook
-        handles.append(module.register_forward_hook(make_hook(wl)))
-    dev = next(model.parameters()).device
-    with torch.no_grad():
-        for b in calib_batches:
-            model(b.to(dev))
-    for h in handles: h.remove()
-    return {n: w.get_scaler().cpu() for n, w in wrapped.items()}
-
 # ── metrics ──────────────────────────────────────────────────────────────────
-def mask_corr(Wp_np, rng, max_rows=256):
-    m = (np.abs(Wp_np) < ZERO_THRESH).astype(np.float32)
-    if m.shape[0] > max_rows:
-        m = m[rng.choice(m.shape[0], max_rows, replace=False)]
-    m -= m.mean(axis=1, keepdims=True)
-    m /= (np.linalg.norm(m, axis=1, keepdims=True) + 1e-12)
-    corr = m @ m.T
-    return float(np.mean(np.abs(corr[np.triu_indices(len(corr), k=1)])))
-
 def spearman(x, y):
     rx = np.argsort(np.argsort(x)).astype(np.float64)
     ry = np.argsort(np.argsort(y)).astype(np.float64)
@@ -196,7 +138,7 @@ def analyze_layer(name, pat, role, block_idx, W_dense, W_prun, xn, n_heads, rng)
     dead_cols = (mask_zero.mean(axis=0) >= ROW_THRESH)
     head_dead_col_frac = np.array([dead_cols[h*dh:(h+1)*dh].mean()
                                    for h in range(n_heads)])
-    rho = mask_corr(Wp_np, rng)
+    rho = mask_corr(Wp_np, rng=rng)
     sp_corr = spearman(head_norms, head_zero_rate)   # predicted << 0 for target
 
     # C. spectral / rank consequences
@@ -209,11 +151,7 @@ def analyze_layer(name, pat, role, block_idx, W_dense, W_prun, xn, n_heads, rng)
     R10 = float(Sp[:10].sum().item() / (Sd[:10].sum().item() + 1e-30))
 
     # Delta(zero_rows) under SVD-left (the anomaly's transform)
-    def svd_left_zero_rows(W):
-        U, S, Vt = torch.linalg.svd(W, full_matrices=False)
-        M = (torch.diag(S) @ Vt).cpu().numpy()
-        return float(((np.abs(M) < ZERO_THRESH).mean(axis=1) >= ROW_THRESH).mean())
-    delta_svdleft = svd_left_zero_rows(Wp) - svd_left_zero_rows(Wd)
+    delta_svdleft = zero_row_frac(tg_svd_left(Wp, None)) - zero_row_frac(tg_svd_left(Wd, None))
 
     return {
         "layer": name, "layer_type": pat, "role": role, "block_idx": block_idx,
@@ -236,10 +174,10 @@ def main():
     for model_key in args.models:
         arch     = get_arch(model_key)
         model_id = MODEL_REGISTRY[model_key]
-        (prune_wanda, prune_sparsegpt, prune_magnitude,
-         check_sparsity, get_loaders) = import_official_pruners(args.wanda_repo, arch)
-        PRUNERS = {"wanda": prune_wanda, "sparsegpt": prune_sparsegpt,
-                   "magnitude": prune_magnitude}
+        off = import_official_pruners(arch, args.wanda_repo)
+        check_sparsity, get_loaders = off["check_sparsity"], off["get_loaders"]
+        PRUNERS = {"wanda": off["prune_wanda"], "sparsegpt": off["prune_sparsegpt"],
+                   "magnitude": off["prune_magnitude"]}
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
 
         for method in args.methods:
@@ -263,7 +201,8 @@ def main():
             calib_batches = [b[0] for b in calib[:32]]
 
             print("  collecting dense-model activation scalers ...", flush=True)
-            scalers = collect_scalers(model, arch, calib_batches)
+            scalers = collect_scalers(model, calib_batches,
+                                      keep=lambda n: layer_role(n, arch)[0] is not None)
 
             # dense snapshots of ALL target/control layers, every block
             dense_snapshots = {}
@@ -322,7 +261,7 @@ def main():
             summ.to_csv(os.path.join(tag, "summary_by_layer_type.csv"))
 
             # depth trend for the target layer
-            tgt = df[df.role == "target"].sort_values("block_idx")
+            tgt = df[df["role"] == "target"].sort_values("block_idx")
             trend = tgt[["block_idx", "xn_across_head_share", "rho_M",
                          "rank_drop_1em3", "delta_svdleft_zero_rows"]]
             trend.to_csv(os.path.join(tag, "target_depth_trend.csv"), index=False)

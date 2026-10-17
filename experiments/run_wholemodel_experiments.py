@@ -1,5 +1,5 @@
 """
-Whole-model pruning + transform suite (rebuttal, all reviewers).
+Whole-model protocol: official Wanda/SparseGPT pruning + transform suite.
 
 Motivation: the existing pipeline (run_experiments.py / run_experiments_rebuttal.py)
 prunes each sampled layer FUNCTIONALLY IN ISOLATION, with Wanda scalers collected
@@ -21,63 +21,51 @@ What this buys the rebuttal:
   - R3 reproducibility: pruning is the official implementation, so perplexity
     sanity-checks against published Wanda numbers (llama-7b @ 50%: 7.26 wikitext2).
 
-Setup:
-  git clone https://github.com/locuslab/wanda            # official repo
-  python run_wholemodel_experiments.py \
-      --wanda_repo ./wanda --models opt-125m \
+The official code is vendored (patched) in third_party/wanda, the default
+--wanda_repo, so no clone step is needed.
+
+Usage:
+  python experiments/run_wholemodel_experiments.py --models opt-125m \
       --methods wanda sparsegpt --sparsity 0.5 --seeds 0 1 2 --eval_ppl
 
   # E3 (anomaly deletion):
-  python run_wholemodel_experiments.py \
-      --wanda_repo ./wanda --models llama-7b --methods wanda --sparsity 0.5 \
-      --truncate_oproj 1 --eval_ppl
+  python experiments/run_wholemodel_experiments.py --models llama-7b \
+      --methods wanda --sparsity 0.5 --truncate_oproj 1 --eval_ppl
 
-NOTE: the official repo splits LLaMA and OPT support (lib/prune.py vs
-lib/prune_opt.py, main.py vs main_opt.py). The import shim below handles both;
-if your checkout differs, adjust `import_official_pruners`.
+Scalers for the activation-aware transforms (PCA_right, SVD_weighted,
+Diagonal_scaling) are collected from the DENSE model on the first 8
+calibration sequences; pruning itself uses all --nsamples (128).
 """
+import os, sys, json, argparse, warnings, types
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-import os, sys, json, argparse, warnings, types, copy
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from scipy import linalg as spla
-from scipy.fft import dct
-from scipy.sparse.csgraph import reverse_cuthill_mckee
-from scipy.sparse import csr_matrix
 from scipy import stats as spstats
-from sklearn.decomposition import PCA as skPCA
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from pruning_transforms.config import (
+    MODEL_REGISTRY, ZERO_THRESH, ROW_THRESH, SV_TOP_KS, MIN_DIM, MAX_C_OUT,
+    RESULTS_ROOT, DEFAULT_WANDA_REPO, get_arch, is_eligible, sampled_blocks)
+from pruning_transforms.metrics import (
+    zero_row_frac, zero_col_frac, near_zero_row_frac, block_sparsity_frac,
+    rank_at_thresholds, spectral_metrics, mask_corr)
+from pruning_transforms.pruning import (
+    collect_scalers, prune_magnitude_perrow, import_official_pruners)
+from pruning_transforms.transforms import ALL_TRANSFORMS
 warnings.filterwarnings("ignore")
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-MODEL_REGISTRY = {
-    "opt-125m"  : "facebook/opt-125m",
-    "opt-1.3b"  : "facebook/opt-1.3b",
-    "opt-6.7b"  : "facebook/opt-6.7b",
-    "opt-13b"   : "facebook/opt-13b",
-    "llama-7b"  : "huggyllama/llama-7b",
-    "llama-13b" : "huggyllama/llama-13b",
-}
-LAYER_PATTERNS = {
-    "opt"  : ["fc1", "fc2", "q_proj", "k_proj", "v_proj", "out_proj"],
-    "llama": ["up_proj", "down_proj", "gate_proj", "q_proj", "k_proj", "v_proj", "o_proj"],
-}
-
-ZERO_THRESH = 1e-6
-ROW_THRESH  = 0.99
-BLOCK_SIZE  = 4
-SV_TOP_KS   = [5, 10, 20, 50]
-RANK_THRESHOLDS = [(1e-3,'1em3'), (1e-4,'1em4'), (1e-5,'1em5'), (1e-6,'1em6')]
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-RESULTS_DIR = "results_wholemodel"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--wanda_repo", type=str, required=True,
-                    help="Path to a checkout of https://github.com/locuslab/wanda")
+parser.add_argument("--wanda_repo", type=str, default=str(DEFAULT_WANDA_REPO),
+                    help="Path to the (patched) locuslab/wanda tree "
+                         "(default: vendored third_party/wanda)")
 parser.add_argument("--models", nargs="+", default=["opt-125m"],
                     choices=list(MODEL_REGISTRY.keys()))
 parser.add_argument("--methods", nargs="+", default=["wanda"],
@@ -96,32 +84,10 @@ parser.add_argument("--truncate_oproj", type=int, default=None, metavar="BLOCK_I
                          "this block to its SVD-left non-zero-row rank and re-eval.")
 parser.add_argument("--dtype", type=str, default="float16",
                     choices=["float16", "float32"])
+parser.add_argument("--results_dir", default=str(RESULTS_ROOT / "wholemodel"))
 args = parser.parse_args()
+RESULTS_DIR = args.results_dir
 
-# ── Official-repo import shim ─────────────────────────────────────────────────
-def import_official_pruners(repo_path, arch):
-    """Returns (prune_wanda, prune_sparsegpt, prune_magnitude, check_sparsity,
-    eval_ppl, get_loaders) from the official locuslab/wanda checkout."""
-    repo_path = os.path.abspath(repo_path)
-    if repo_path not in sys.path:
-        sys.path.insert(0, repo_path)
-    from lib.data import get_loaders                      # shared
-    if arch == "llama":
-        from lib.prune import (prune_wanda, prune_sparsegpt,
-                               prune_magnitude, check_sparsity)
-        from lib.eval import eval_ppl
-    else:
-        # OPT pruners live in a parallel module in the official repo.
-        # IMPORTANT: import pruners and eval SEPARATELY — a missing
-        # lib/eval_opt.py must not silently fall the pruners back to the
-        # LLaMA lib.prune (model.model.layers vs model.model.decoder.layers).
-        from lib.prune_opt import (prune_wanda, prune_sparsegpt,
-                                   prune_magnitude, check_sparsity)
-        try:
-            from lib.eval_opt import eval_ppl
-        except ImportError:
-            from lib.eval import eval_ppl
-    return prune_wanda, prune_sparsegpt, prune_magnitude, check_sparsity, eval_ppl, get_loaders
 
 def call_eval_ppl(eval_ppl_fn, ns, model, tokenizer, device):
     """Official eval_ppl signature changed across commits; try both."""
@@ -130,192 +96,6 @@ def call_eval_ppl(eval_ppl_fn, ns, model, tokenizer, device):
     except TypeError:
         return float(eval_ppl_fn(model, tokenizer, device))
 
-# ── Helpers shared with the existing pipeline (same conventions) ─────────────
-def get_arch(model_key):
-    return "llama" if "llama" in model_key else "opt"
-
-def is_eligible(name, arch):
-    return (any(p in name for p in LAYER_PATTERNS[arch]) and "lm_head" not in name)
-
-def zero_row_frac(W, zt=ZERO_THRESH, rt=ROW_THRESH):
-    return float(((np.abs(W) < zt).mean(axis=1) >= rt).mean())
-
-def zero_col_frac(W, zt=ZERO_THRESH, rt=ROW_THRESH):
-    return float(((np.abs(W) < zt).mean(axis=0) >= rt).mean())
-
-def near_zero_row_frac(W, thresh=0.01):
-    norms = np.linalg.norm(W, axis=1)
-    return float((norms < thresh * (norms.mean() + 1e-12)).mean())
-
-def block_sparsity_frac(W, bs=BLOCK_SIZE, thresh=0.9):
-    C_out, C_in = W.shape
-    nr, nc = C_out // bs, C_in // bs
-    if nr == 0 or nc == 0: return 0.0
-    blocks = np.abs(W[:nr*bs, :nc*bs]).reshape(nr, bs, nc, bs)
-    zero_frac = (blocks < ZERO_THRESH).mean(axis=(1, 3))
-    return float((zero_frac >= thresh).mean())
-
-def rank_at_thresholds(W, S_dense_max):
-    S = torch.linalg.svdvals(W)
-    return {f"rank_{k}": int((S > S_dense_max * t).sum().item())
-            for t, k in RANK_THRESHOLDS}
-
-def spectral_metrics(S_dense, S_pruned):
-    def eff_rank(S):
-        s = S / (S.sum() + 1e-12) + 1e-15
-        return float(torch.exp(-(s * torch.log(s)).sum()).item())
-    out = {"eff_rank_dense": eff_rank(S_dense), "eff_rank_pruned": eff_rank(S_pruned)}
-    for k in SV_TOP_KS:
-        kk = min(k, S_dense.shape[0], S_pruned.shape[0])
-        out[f"top{k}_ratio"] = float(S_pruned[:kk].sum().item() /
-                                     (S_dense[:kk].sum().item() + 1e-12))
-    return out
-
-def mask_corr_fast(W_pruned, max_rows=256):
-    mask = (np.abs(W_pruned) < ZERO_THRESH).astype(np.float32)
-    if mask.shape[0] > max_rows:
-        idx = np.random.choice(mask.shape[0], max_rows, replace=False)
-        mask = mask[idx]
-    mask -= mask.mean(axis=1, keepdims=True)
-    mask /= (np.linalg.norm(mask, axis=1, keepdims=True) + 1e-12)
-    corr = mask @ mask.T
-    off  = corr[np.triu_indices(len(corr), k=1)]
-    return float(np.mean(np.abs(off)))
-
-# ── Transform suite (identical definitions to run_experiments_rebuttal.py) ──
-def tg_identity(Wp, xn):    return Wp.cpu().numpy()
-
-def tg_svd_right(Wp, xn):
-    _, _, Vt = torch.linalg.svd(Wp, full_matrices=False)
-    return (Wp @ Vt.T).cpu().numpy()
-
-def tg_svd_left(Wp, xn):
-    U, S, Vt = torch.linalg.svd(Wp, full_matrices=False)
-    return (torch.diag(S) @ Vt).cpu().numpy()
-
-def tg_svd_twosided(Wp, xn):
-    U, S, Vt = torch.linalg.svd(Wp, full_matrices=False)
-    W2 = torch.zeros_like(Wp); k = S.shape[0]
-    W2[:k, :k] = torch.diag(S)
-    return W2.cpu().numpy()
-
-def tg_svd_weighted(Wp, xn):
-    U, S, Vt = torch.linalg.svd(Wp * xn.reshape(1,-1), full_matrices=False)
-    return (torch.diag(S) @ Vt).cpu().numpy()
-
-def tg_diagonal_scaling(Wp, xn):
-    return (Wp * xn.reshape(1,-1)).cpu().numpy()
-
-def tg_col_sort(Wp, xn):
-    zero_frac = (Wp.abs() < ZERO_THRESH).float().mean(dim=0)
-    return Wp[:, torch.argsort(zero_frac, descending=True)].cpu().numpy()
-
-def tg_row_sort(Wp, xn):
-    zero_frac = (Wp.abs() < ZERO_THRESH).float().mean(dim=1)
-    return Wp[torch.argsort(zero_frac, descending=True)].cpu().numpy()
-
-def tg_qr_left(Wp, xn):
-    Q, R = torch.linalg.qr(Wp, mode='complete')
-    return R.cpu().numpy()
-
-def tg_hadamard_right(Wp, xn):
-    n = Wp.shape[1]
-    p = int(2**np.ceil(np.log2(n)))
-    H_np = (spla.hadamard(p, dtype=np.float32) / np.sqrt(p)).astype(np.float32)
-    H = torch.tensor(H_np, device=Wp.device)
-    return (Wp @ H[:n,:n]).cpu().numpy()
-
-def tg_dct_right(Wp, xn):
-    n = Wp.shape[1]
-    Q = torch.tensor(dct(np.eye(n, dtype=np.float32), axis=0, norm='ortho').T,
-                     device=Wp.device)
-    return (Wp @ Q).cpu().numpy()
-
-def tg_pca_right(Wp, xn):
-    xn_np = xn.cpu().numpy(); C_in = len(xn_np)
-    rng   = np.random.default_rng(42)
-    X     = rng.standard_normal((C_in + 10, C_in)).astype(np.float32) * xn_np
-    pca   = skPCA(n_components=C_in); pca.fit(X)
-    Q_gpu = torch.tensor(pca.components_.T, device=Wp.device)
-    return (Wp @ Q_gpu).cpu().numpy()
-
-def tg_lu_left(Wp, xn):
-    _, _, U = spla.lu(Wp.cpu().numpy()); return U
-
-def tg_cuthill_mckee(Wp, xn):
-    W_np = Wp.cpu().numpy()
-    adj  = csr_matrix((np.abs(W_np) > ZERO_THRESH).astype(np.float32))
-    if adj.shape[0] == adj.shape[1]:
-        return W_np[reverse_cuthill_mckee(adj)]
-    return W_np
-
-TRANSFORMS = {
-    "Identity": tg_identity, "PCA_right": tg_pca_right, "SVD_right": tg_svd_right,
-    "SVD_left": tg_svd_left, "SVD_twosided": tg_svd_twosided, "QR_left": tg_qr_left,
-    "LU_left": tg_lu_left, "Hadamard_right": tg_hadamard_right, "DCT_right": tg_dct_right,
-    "Diagonal_scaling": tg_diagonal_scaling, "Col_sort": tg_col_sort,
-    "Row_sort": tg_row_sort, "SVD_weighted": tg_svd_weighted,
-    "Cuthill_McKee": tg_cuthill_mckee,
-}
-
-# ── Wanda scaler collection on the dense model (for xn-dependent transforms) ─
-class WrappedLayer:
-    def __init__(self, layer):
-        self.columns    = layer.weight.data.shape[1]
-        self.scaler_row = torch.zeros(self.columns, device=layer.weight.device)
-        self.nsamples   = 0
-    def add_batch(self, inp):
-        if len(inp.shape) == 2: inp = inp.unsqueeze(0)
-        tmp = inp.shape[0]
-        if len(inp.shape) == 3: inp = inp.reshape((-1, inp.shape[-1]))
-        inp = inp.t()
-        self.scaler_row *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples   += tmp
-        inp = inp.float()
-        self.scaler_row += torch.norm(inp, p=2, dim=1) ** 2 / self.nsamples
-    def get_scaler(self):
-        return torch.sqrt(self.scaler_row)
-
-def collect_scalers(model, calib_batches, arch):
-    wrapped, handles = {}, []
-    for name, module in model.named_modules():
-        if not isinstance(module, nn.Linear): continue
-        if not is_eligible(name, arch): continue
-        wl = WrappedLayer(module); wrapped[name] = wl
-        def make_hook(w):
-            def hook(m, inp, out): w.add_batch(inp[0].detach())
-            return hook
-        handles.append(module.register_forward_hook(make_hook(wl)))
-    with torch.no_grad():
-        for batch in calib_batches:
-            model(batch.to(next(model.parameters()).device))
-    for h in handles: h.remove()
-    return {n: w.get_scaler().cpu() for n, w in wrapped.items()}
-
-# ── Per-row (per-output) magnitude pruning ───────────────────────────────────
-# R2's "one additional per-output method": per row, prune the smallest
-# sparsity-fraction of weights by |W|. Same per-output comparison group as
-# Wanda/SparseGPT but no activation statistics and no weight update, so it
-# isolates the per-output grouping itself. Deterministic (no calibration):
-# run with a single seed. No official implementation exists; this matches
-# magnitude_prune_perrow from our original pipeline, applied whole-model.
-def prune_magnitude_perrow(model, arch, sparsity):
-    for name, m in model.named_modules():
-        if isinstance(m, nn.Linear) and is_eligible(name, arch):
-            W = m.weight.data
-            n_prune = int(W.shape[1] * sparsity)
-            if n_prune <= 0:
-                continue
-            _, idx = torch.topk(W.abs(), n_prune, dim=1,
-                                largest=False, sorted=False)
-            W.scatter_(1, idx, 0.0)
-
-# ── 10-bin depth sampling (same as existing pipeline) ────────────────────────
-def sampled_blocks(n_blocks, n_bins=10):
-    edges = np.linspace(0, n_blocks, n_bins + 1)
-    idxs = sorted(set(min(int((edges[b] + edges[b+1]) / 2), n_blocks - 1)
-                      for b in range(n_bins)))
-    return idxs
 
 # ── E3: SVD-left-guided rank truncation of one o_proj/out_proj ───────────────
 def truncate_oproj(model, arch, block_idx):
@@ -363,7 +143,7 @@ def analyze_model(model, arch, model_key, scalers, dense_snapshots, method,
     n_todo = len(todo)
     t_start = time.time()
     print(f"  analyzing {n_todo} sampled layers "
-          f"({len(TRANSFORMS)} transforms x 2 variants each) ...", flush=True)
+          f"({len(ALL_TRANSFORMS)} transforms x 2 variants each) ...", flush=True)
     for li, (name, module) in enumerate(todo, 1):
         t_layer = time.time()
 
@@ -388,11 +168,11 @@ def analyze_model(model, arch, model_key, scalers, dense_snapshots, method,
             "eff_rank_dense": spec["eff_rank_dense"],
             "eff_rank_pruned": spec["eff_rank_pruned"],
             **{f"top{k}_ratio": spec[f"top{k}_ratio"] for k in SV_TOP_KS},
-            "mask_corr": mask_corr_fast(W_prun.cpu().numpy()),
+            "mask_corr": mask_corr(W_prun.cpu().numpy()),
             "actual_sparsity": float((W_prun.abs() < ZERO_THRESH).float().mean().item()),
         })
 
-        for tname, tfn in TRANSFORMS.items():
+        for tname, tfn in ALL_TRANSFORMS.items():
             for Wx, plabel in [(W_prun, method), (W_dense, "dense")]:
                 try:
                     Wt = np.nan_to_num(tfn(Wx, xn))
@@ -423,13 +203,15 @@ def analyze_model(model, arch, model_key, scalers, dense_snapshots, method,
 
     df_t = pd.DataFrame(transform_rows)
     df_d = pd.DataFrame(diag_rows)
-    pd.DataFrame(failures).to_csv(os.path.join(out_dir, "transform_failures.csv"), index=False)
+    pd.DataFrame(failures, columns=[
+        "model", "layer", "method", "sparsity", "seed", "transform", "pruning",
+        "error_type", "error_msg"]).to_csv(os.path.join(out_dir, "transform_failures.csv"), index=False)
     df_t.to_csv(os.path.join(out_dir, "transform_results.csv"), index=False)
     df_d.to_csv(os.path.join(out_dir, "layer_diagnostics.csv"), index=False)
 
-    pruned_z = df_t[df_t.pruning == method].groupby("transform")[
+    pruned_z = df_t[df_t["pruning"] == method].groupby("transform")[
         ["zero_rows", "zero_cols", "block4x4"]].mean()
-    dense_z  = df_t[df_t.pruning == "dense"].groupby("transform")[
+    dense_z  = df_t[df_t["pruning"] == "dense"].groupby("transform")[
         ["zero_rows", "zero_cols", "block4x4"]].mean()
     delta    = (pruned_z - dense_z)
     delta.to_csv(os.path.join(out_dir, "delta_per_transform.csv"))
@@ -440,11 +222,11 @@ def main():
     for model_key in args.models:
         arch     = get_arch(model_key)
         model_id = MODEL_REGISTRY[model_key]
-        (prune_wanda, prune_sparsegpt, prune_magnitude,
-         check_sparsity, eval_ppl, get_loaders) = import_official_pruners(
-            args.wanda_repo, arch)
-        PRUNERS = {"wanda": prune_wanda, "sparsegpt": prune_sparsegpt,
-                   "magnitude": prune_magnitude}
+        off = import_official_pruners(arch, args.wanda_repo)
+        check_sparsity, eval_ppl, get_loaders = (
+            off["check_sparsity"], off["eval_ppl"], off["get_loaders"])
+        PRUNERS = {"wanda": off["prune_wanda"], "sparsegpt": off["prune_sparsegpt"],
+                   "magnitude": off["prune_magnitude"]}
 
         tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
 
@@ -476,14 +258,14 @@ def main():
                         n_blocks = len(model.model.decoder.layers)
                     else:
                         n_blocks = len(model.model.layers)
-                    blocks = sampled_blocks(n_blocks)
+                    blocks = sampled_blocks(n_blocks)   # 10-bin depth sampling
                     sample_strs = [f"layers.{i}." for i in blocks]
                     dense_snapshots = {}
                     for name, m in model.named_modules():
                         if (isinstance(m, nn.Linear) and is_eligible(name, arch)
                                 and any(s in name for s in sample_strs)):
                             C_out, C_in = m.weight.shape
-                            if C_out < 64 or C_in < 64 or C_out > 16384: continue
+                            if C_out < MIN_DIM or C_in < MIN_DIM or C_out > MAX_C_OUT: continue
                             dense_snapshots[name] = m.weight.data.detach().clone().cpu()
                     print(f"  snapshot: {len(dense_snapshots)} sampled layers "
                           f"(blocks {blocks})")
@@ -491,7 +273,8 @@ def main():
                     calib, _ = get_loaders("c4", nsamples=args.nsamples, seed=seed,
                                            seqlen=model.seqlen, tokenizer=tokenizer)
                     calib_batches = [b[0] for b in calib[:8]]  # short pass for scalers
-                    scalers = collect_scalers(model, calib_batches, arch)
+                    scalers = collect_scalers(model, calib_batches,
+                                              keep=lambda n: is_eligible(n, arch))
 
                     # ── whole-model pruning ──────────────────────────────────
                     if method == "magnitude_perrow":
@@ -549,7 +332,7 @@ def main():
 def aggregate_seed_variance():
     """Collect delta_per_transform.csv across seeds; report mean, std, and a
     one-sample t-test of H0: Delta = 0 per (model, method, sparsity, transform,
-    metric). Written to results_wholemodel/seed_variance_summary.csv."""
+    metric). Written to <results_dir>/seed_variance_summary.csv."""
     rows = []
     for root, _, files in os.walk(RESULTS_DIR):
         if "delta_per_transform.csv" in files and "seed" in os.path.basename(root):
@@ -582,7 +365,7 @@ def aggregate_seed_variance():
     path = os.path.join(RESULTS_DIR, "seed_variance_summary.csv")
     df.to_csv(path, index=False)
     print(f"\nSeed-variance summary written to {path}")
-    sig = df[(df.p_value < 0.05) & (df.metric == "zero_rows")]
+    sig = df[(df["p_value"] < 0.05) & (df["metric"] == "zero_rows")]
     if len(sig):
         print("Transforms with Delta(zero_rows) significantly != 0 (p<0.05):")
         print(sig.round(5).to_string(index=False))
