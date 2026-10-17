@@ -1,0 +1,23 @@
+# Exact versions from the `kita` conda env (Python 3.9.13) used for the
+# camera-ready runs. Do not upgrade: see README "Environment".
+# torch 2.8.0 is the CUDA 12.8 build (2.8.0+cu128). Install it from the
+# PyTorch index first if pip's default wheel does not match your CUDA:
+#   pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+transformers==4.57.1
+datasets==3.5.0
+numpy==2.0.2
+scipy==1.13.1
+scikit-learn==1.6.1
+pandas==2.2.3
+# required by the above / by the vendored Wanda tree and the figure script
+accelerate==1.6.0
+huggingface-hub==0.36.0
+tokenizers==0.22.1
+safetensors==0.5.3
+sentencepiece==0.2.0
+protobuf==6.30.2
+fsspec==2024.12.0
+pyarrow==19.0.1
+tqdm==4.67.1
+matplotlib==3.9.4

@@ -1,0 +1,12 @@
+# Conda equivalent of requirements.txt (same pinned versions).
+#   conda env create -f environment.yml && conda activate scattered-by-design
+name: scattered-by-design
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9.13
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - -r requirements.txt
