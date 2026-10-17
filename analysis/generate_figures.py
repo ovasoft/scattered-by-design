@@ -1,15 +1,17 @@
 """
-generate_figures.py — Generate all Section 5 visualizations.
+Render the Section 5 figures from per-layer CSVs (nothing is recomputed).
 
-Reads from results/{model}/*.csv
-Produces: figures/fig1_rank_drop.png
-          figures/fig2_spectral.png
-          figures/fig3_mask_corr.png
-          figures/fig4_diagnostic.png
+Reads:    <results_dir>/<model>/{layer_diagnostics,transform_results}.csv
+          (per-layer schema, written by experiments/run_experiments.py)
+Produces: <out_dir>/fig1_rank_drop.png   rank drop across thresholds
+          <out_dir>/fig2_spectral.png    R10 spectral energy ratio vs depth
+          <out_dir>/fig3_mask_corr.png   rho(M): Wanda vs random vs magnitude
+          <out_dir>/fig4_diagnostic.png  rank drop / R10 vs max Delta
+          <out_dir>/fig5_heatmap.png     mean Delta per transform x layer type
 
 Usage:
-  python generate_figures.py
-  python generate_figures.py --results_dir results --models opt-125m opt-1.3b opt-6.7b
+  python analysis/generate_figures.py
+  python analysis/generate_figures.py --results_dir results/perlayer --models opt-125m opt-1.3b opt-6.7b
 """
 
 import os, json, argparse
@@ -22,11 +24,12 @@ import matplotlib.ticker as mticker
 from matplotlib.lines import Line2D
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--results_dir", default="results")
+REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+parser.add_argument("--results_dir", default=os.path.join(REPO, "results", "perlayer"))
 parser.add_argument("--models", nargs="+",
                     default=["opt-125m","opt-1.3b","opt-6.7b","opt-13b",
                              "llama-7b","llama-13b"])
-parser.add_argument("--out_dir", default="figures")
+parser.add_argument("--out_dir", default=os.path.join(REPO, "figures"))
 args = parser.parse_args()
 
 os.makedirs(args.out_dir, exist_ok=True)
@@ -47,8 +50,8 @@ for model in args.models:
         trans_dfs[model] = pd.read_csv(trans)
 
 if not diag_dfs:
-    print("No results found. Run run_experiments.py first.")
-    exit(1)
+    print("No results found. Run experiments/run_experiments.py first.")
+    raise SystemExit(1)
 
 # ── Style ─────────────────────────────────────────────────────────────────────
 MODEL_DISPLAY = {
@@ -233,9 +236,9 @@ def fig4_diagnostic():
         df_d = diag_dfs[model]
         df_t = trans_dfs[model]
 
-        w = df_t[df_t.pruning=="wanda"][["layer","transform","zero_rows"]].rename(
+        w = df_t[df_t["pruning"]=="wanda"][["layer","transform","zero_rows"]].rename(
                 columns={"zero_rows":"zr_w"})
-        d = df_t[df_t.pruning=="dense"][["layer","transform","zero_rows"]].rename(
+        d = df_t[df_t["pruning"]=="dense"][["layer","transform","zero_rows"]].rename(
                 columns={"zero_rows":"zr_d"})
         mg = w.merge(d, on=["layer","transform"])
         mg["delta"] = (mg["zr_w"] - mg["zr_d"]) * 100
@@ -298,9 +301,9 @@ def fig5_heatmap():
     all_trans = []
     for model in completed:
         df = trans_dfs[model]
-        w  = df[df.pruning=="wanda"][["layer","transform","zero_rows","layer_type"]].rename(
+        w  = df[df["pruning"]=="wanda"][["layer","transform","zero_rows","layer_type"]].rename(
                  columns={"zero_rows":"zr_w"})
-        d  = df[df.pruning=="dense"][["layer","transform","zero_rows"]].rename(
+        d  = df[df["pruning"]=="dense"][["layer","transform","zero_rows"]].rename(
                  columns={"zero_rows":"zr_d"})
         mg = w.merge(d, on=["layer","transform"])
         mg["delta"] = (mg["zr_w"] - mg["zr_d"]) * 100
