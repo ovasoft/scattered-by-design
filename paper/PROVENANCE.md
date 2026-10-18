@@ -193,7 +193,3 @@ this release; the others are read from the original result-file timestamps.
 ### Table A8: LLaMA-7B o_proj depth profile (`tab:app_depth`). **Whole-model**
 - data/file: as Table 6, `results/oproj_mechanism/llama-7b/wanda/sp50/layer_mechanism.csv`
 - render: `python analysis/generate_tables.py --table a8`
-- note: blocks 0–2 match the PDF. The two mean rows render from the CSV as
-  3–15: 0.585 / 0.067 / −0.8 and 16–31: 0.782 / 0.098 / +1.0 (across-head /
-  ρ(M) / rank-drop). The PDF prints 0.624 / 0.066 / −0.5 and 0.783 / 0.097 / +0.8.
-  Dead heads (0/32) and Δ (0.00%) agree.
