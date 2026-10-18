@@ -339,7 +339,7 @@ def t_rotation(P):
     # the output of test_hypothesis.py / test_hypothesis_v2.py. Those scripts
     # are not in this repository (they were not found on the authors'
     # machine), so this table cannot be regenerated. It is reproduced
-    # verbatim and flagged; see README "Known gaps".
+    # verbatim and flagged.
     rotation_data = [
         ("Identity (no rotation)",   "Baseline: Wanda scores on $W$",                   "0.00\\%", "0.00\\%"),
         ("PCA rotation",             "Right-multiply by activation PCA basis",           "0.06\\%", "0.38\\%"),
@@ -379,7 +379,7 @@ def t_rotation(P):
 
 
 def t_appendix(P):
-    # REPORTED, NOT FIXED (see README "Known gaps"): for the Exact-rows rows
+    # REPORTED, NOT FIXED: for the Exact-rows rows
     # this compares Wanda zero_rows at threshold t (sensitivity.csv) against
     # DENSE zero_rows at the fixed 1e-6 threshold (transform_results.csv); the
     # dense side is never re-thresholded, because the pipeline does not store

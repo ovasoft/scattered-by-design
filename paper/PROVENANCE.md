@@ -137,9 +137,9 @@ Runtimes are wall-clock times read from the original result-file timestamps
 ### Appendix A1: all metrics × thresholds (`tab:app_metrics`). **Per-layer protocol**
 - data/file: as Table 2, plus `results/perlayer/{model}/sensitivity.csv`
 - render: `python analysis/generate_tables.py --table appendix --models ...`
-- note: see README "Known gaps" (the threshold rows compare different
-  thresholds for the pruned and dense sides). Reproduced as published,
-  pending the authors' decision.
+- note: the threshold rows compare different thresholds for the pruned and
+  dense sides (the dense side is stored only at 1e-6), and the 1e-5 row is
+  not in the sweep. Reproduced as published.
 
 ### Figures 1–5 (Section 5). **Per-layer protocol**
 - data/file: as Table 2

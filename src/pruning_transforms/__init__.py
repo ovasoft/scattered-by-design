@@ -1,6 +1,5 @@
 """Shared transforms, metrics, pruning functions and constants for
-"Scattered by Design: Why Post-Hoc Transformation Cannot Bridge Unstructured
-and Structured LLM Pruning"."""
+"Scattered by Design: Why Per-Output Pruning Resists Structured Compression"."""
 from . import config, metrics, pruning, transforms
 from .transforms import ALL_TRANSFORMS, BASELINE, TRANSFORMS
 

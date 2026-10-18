@@ -1,7 +1,7 @@
 # Scattered by Design
 
-Code for **Scattered by Design: Why Post-Hoc Transformation Cannot Bridge
-Unstructured and Structured LLM Pruning** (NeurIPS 2026).
+Code for **Scattered by Design: Why Per-Output Pruning Resists Structured
+Compression** (NeurIPS 2026).
 
 Per-output pruning methods (Wanda, SparseGPT, per-row magnitude) produce
 unstructured sparsity, and no post-hoc linear transformation turns it into
@@ -208,65 +208,6 @@ Both protocols analyse the same layers. They split model depth into 10 equal
 bins and take every linear layer type in the central block of each bin. Rank
 thresholds are always anchored to σ_max of the *dense* matrix.
 
-## Differences from the submitted version
-
-1. **Cholesky.** The submitted transform table listed Cholesky, but the code
-   never implemented it. The code's two-sided SVD (`SVD_twosided`) is what
-   ran. The camera-ready table and the code now agree, and Cholesky appears
-   nowhere in the code. Table 1 also listed **ZCA**, which was likewise
-   never implemented. `generate_tables.py` now lists exactly the 13
-   implemented transforms.
-2. **Transform count.** `TRANSFORMS` holds the 13 transformations. `BASELINE`
-   holds `Identity`, the untransformed reference. `ALL_TRANSFORMS` is both
-   together (14 rows per layer in every CSV).
-3. **`Col_sort` semantics.** The manuscript says "column sorting by
-   activation magnitude". The code sorts columns by their fraction of exact
-   zeros (|w| < 1e-6), most-zero first, and ignores activations. Every
-   reported number used the code's behaviour, which is unchanged and now
-   documented in its docstring. The manuscript text should be corrected.
-4. **Silent exception handling.** `run_experiments.py` wrapped the transform
-   loop in a bare `except: pass`, so a crashed transform looked like a zero
-   result. Every transform loop now logs failures to `transform_failures.csv`
-   and to the console. This covers both per-layer scripts, the whole-model
-   script, and the per-layer SparseGPT prune. Scripts exit non-zero if a
-   whole model fails.
-5. **Hadamard dtype.** `spla.hadamard(p, dtype=np.float32) / np.sqrt(p)` is
-   promoted to float64 under NumPy ≥ 2. That breaks the float32 matmul, and
-   in `run_experiments.py` the bare `except` hid the error. The fix
-   (`.astype(np.float32)`) now lives in the single shared definition. The
-   per-layer LLaMA-7B/13B main-sweep CSVs therefore lack Hadamard rows
-   (rendered `[X]`). LLaMA-7B was recomputed in the rebuttal run
-   (Δ = 0.0). LLaMA-13B was not recomputed.
-6. **`df.transform` attribute collision.** `df.transform == "SVD_left"`
-   compares the DataFrame *method* `transform`, not the column. All analysis
-   code now uses `df["transform"]` (and `df["pruning"]` etc.). One affected
-   ad-hoc script, `rock.py`, printed `nan` for the per-row-magnitude out_proj
-   Δ(SVD-left). Rendered correctly it is +0.000130 (`--table outproj_perrow`).
-
-### Known gaps (reported, not changed)
-
-- **Pre-pruning rotation table (`tab:rotation`)** is hard-coded. Its source
-  scripts (`test_hypothesis*.py`) are missing.
-- **Appendix A1 (`tab:app_metrics`)** has two problems:
-  - The Exact-rows rows at 1e-3/1e-4 compare Wanda zero_rows at threshold t
-    with dense zero_rows at 1e-6. The dense side is not stored at other
-    thresholds.
-  - The 1e-5 row is always `[X]`, because the sensitivity sweep is
-    {1e-3, 1e-4, 1e-6}.
-
-  The caption's "fully zero" 4×4 blocks are blocks that are ≥ 90% zero.
-  The table is reproduced as published.
-- **`mask_corr`** subsamples 256 rows with NumPy's unseeded global RNG, as in
-  the original runs. Repeated runs differ in the third decimal of ρ(M), and
-  the random-mask control is also unseeded.
-- **Per-layer OPT main-sweep CSVs** include Hadamard rows, which the unfixed
-  code could produce only under NumPy < 2. They were therefore generated in a
-  different environment from the pinned one.
-- **Activation scalers for the activation-aware transforms** (PCA_right,
-  SVD_weighted, Diagonal_scaling) come from the dense model on 8 calibration
-  sequences in the whole-model script, and on 32 in `run_oproj_mechanism.py`.
-  Pruning itself uses 128.
-
 ## Vendored code: attribution
 
 `third_party/wanda/` is a copy of [locuslab/wanda](https://github.com/locuslab/wanda)
@@ -280,11 +221,12 @@ two local modifications. See `third_party/wanda/NOTICE.md` and
 ## Citation
 
 ```bibtex
-@inproceedings{TODO_scattered2026,
-  title     = {Scattered by Design: Why Post-Hoc Transformation Cannot Bridge Unstructured and Structured {LLM} Pruning},
-  author    = {TODO},
-  booktitle = {Advances in Neural Information Processing Systems},
-  year      = {2026}
+@inproceedings{omolaoye2026scattered,
+  title     = {Scattered by Design: Why Per-Output Pruning Resists Structured Compression},
+  author    = {Omolaoye, Victor A. and de Melo, Gerard},
+  booktitle = {The Fortieth Annual Conference on Neural Information Processing Systems},
+  year      = {2026},
+  url       = {https://openreview.net/forum?id=P0XAEBRFU2}
 }
 ```
 
