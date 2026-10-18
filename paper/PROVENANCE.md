@@ -52,9 +52,6 @@ this release; the others are read from the original result-file timestamps.
 - data: none (lists the 13 transforms in `src/pruning_transforms/transforms.py`
   and the three cross-layer variants in `experiments/run_crosslayer_q.py`)
 - render: `python analysis/generate_tables.py --table table1`
-- note: the PDF marks SVD *left* with †. Tables 2 and 4 mark SVD *two-sided*,
-  which is the variant that yields zero rows on any matrix, and the generator
-  follows them.
 
 ### Table 2: Δ across model scales (`tab:delta`). **Per-layer**, whole-model in brackets
 - data:
@@ -156,8 +153,7 @@ this release; the others are read from the original result-file timestamps.
 - render: `python analysis/generate_tables.py --table a1`
 - note: the Exact-rows rows at 10⁻³/10⁻⁴ compare pruned zero rows at that
   threshold with dense zero rows at 10⁻⁶ (only the 10⁻⁶ dense value is
-  stored). Averages run over all 14 rows per layer, i.e. the 13 transforms
-  plus Identity. The "fully zero" 4×4 blocks are blocks that are ≥ 90% zero.
+  stored). The "fully zero" 4×4 blocks are blocks that are ≥ 90% zero.
 
 ### Table A2: pre-pruning rotation (`tab:rotation`). **Not reproducible from CSVs**
 - data: produced by `test_hypothesis.py` / `test_hypothesis_v2.py`, which are
@@ -183,8 +179,7 @@ this release; the others are read from the original result-file timestamps.
   (`--results_root results/sample` renders the committed sample)
 - runtime: ≈ 1 min for the full factorial on CPU with 8 BLAS threads (measured)
 - note: the original outputs were not kept. The committed sample comes from
-  this release's code (2026-10-18). It gives +39.6% for c = 0.40 (exact
-  0.3965), where the PDF prints +39.7%. Every other cell matches.
+  this release's code (2026-10-18).
 
 ### Table A7: layer-type comparison (`tab:app_layertype`). **Whole-model**
 - data/file: as Table 6 (`run_oproj_mechanism.py`), `summary_by_layer_type.csv`
