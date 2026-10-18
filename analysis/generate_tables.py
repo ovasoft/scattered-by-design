@@ -21,6 +21,7 @@ Usage:
   python analysis/generate_tables.py --table rebuttal --results_dir results/perlayer
   python analysis/generate_tables.py --table methods  --results_dir results/wholemodel
   python analysis/generate_tables.py --table all      # every table whose CSVs exist
+  python analysis/generate_tables.py --table camera_ready   # camera-ready Tables 1-7, A1-A8
   python analysis/generate_tables.py --list
 """
 import os, sys, json, glob, argparse
@@ -687,9 +688,9 @@ def t_ppl(results_dir):
     for i in infos:
         t = i.get("truncate_oproj")
         tr = (f"{t['layer'].replace('_', chr(92) + '_')} & {t['rank_kept']}/{min(t['C_out'], t['C_in'])} & "
-              f"{t['rows_deleted']} & {i['ppl_wikitext2_truncated']:.3f}") if t else "-- & -- & -- & --"
+              f"{t['rows_deleted']} & {i['ppl_wikitext2_truncated']:.4f}") if t else "-- & -- & -- & --"
         L.append(f"{MNAME.get(i['model'], i['model'])} & {METHOD_NAME.get(i['method'], i['method'])} & "
-                 f"{i['seed']} & {i['ppl_wikitext2_pruned']:.3f} & {tr} \\\\")
+                 f"{i['seed']} & {i['ppl_wikitext2_pruned']:.4f} & {tr} \\\\")
     L += [r"\bottomrule", r"\end{tabular}", r"\end{table}", ""]
     return L
 
@@ -794,6 +795,374 @@ def t_synthetic(results_dir):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# CAMERA-READY TABLES (numbered as in the camera-ready PDF)
+#
+# These combine protocols (e.g. Table 2 shows per-layer values with whole-model
+# values in brackets), so they read from one results root laid out as the
+# experiment scripts write it:
+#   <root>/perlayer/  <root>/wholemodel/  <root>/crosslayer_q/
+#   <root>/oproj_mechanism/  <root>/synthetic/
+# Nothing is recomputed; only selection, averaging over seeds/layers and
+# formatting happen here.
+# ══════════════════════════════════════════════════════════════════════════════
+CR_MODELS = ["opt-125m", "opt-1.3b", "opt-6.7b", "llama-7b", "llama-13b"]
+
+
+def _half_up(v, nd):
+    """Round half away from zero (-9.25 -> -9.3), as the paper's tables do;
+    Python's format() would print -9.2."""
+    from decimal import Decimal, ROUND_HALF_UP
+    return Decimal(repr(float(v))).quantize(Decimal(1).scaleb(-nd), rounding=ROUND_HALF_UP)
+
+
+def _p2(v):
+    """Whole-model percentage cell: exact zero prints as 0.00%, otherwise signed."""
+    return "0.00\\%" if v == 0 else f"{v*100:+.2f}\\%"
+
+
+def _cr_short_layer(layer, prefix="layers."):
+    parts = layer.split(".")
+    i = parts.index("layers")
+    return f"{prefix}{parts[i+1]}.{parts[-1]}".replace("_", r"\_")
+
+
+def _wm_delta(root, model, method, sp="sp50"):
+    """Whole-model Delta(zero_rows) per transform, mean over available seeds."""
+    paths = glob.glob(os.path.join(root, "wholemodel", model, method, sp, "seed*",
+                                   "delta_per_transform.csv"))
+    if not paths:
+        return None, 0
+    d = pd.concat([pd.read_csv(p, index_col=0) for p in paths])
+    return d.groupby(level=0)["zero_rows"].mean(), len(paths)
+
+
+def _mech(root, model, method="wanda", sp="sp50"):
+    p = os.path.join(root, "oproj_mechanism", model, method, sp, "layer_mechanism.csv")
+    return pd.read_csv(p) if os.path.exists(p) else None
+
+
+def _table(caption, label, colspec, header, body, extra_header=()):
+    return ([r"\begin{table}[ht]", r"\centering", r"\small",
+             r"\caption{" + caption + "}", r"\label{" + label + "}",
+             r"\begin{tabular}{" + colspec + "}", r"\toprule", header + r" \\"]
+            + list(extra_header) + [r"\midrule"] + body
+            + [r"\bottomrule", r"\end{tabular}", r"\end{table}", ""])
+
+
+def cr_table1(root):
+    return _table(
+        r"The 13 linear transformations evaluated, organised by family, together with the"
+        r" learned cross-layer rotations evaluated separately. $^\dagger$These produce zero rows"
+        r" on any matrix as a consequence of shape or decomposition structure, independent of"
+        r" pruning. $^\ddagger$Derived from the residual-stream activation covariance of the"
+        r" pruned model and applied across layers by computational invariance; the Haar-random"
+        r" variant serves as a control.",
+        "tab:transforms", "p{2.8cm}p{5.6cm}p{2.2cm}p{1.8cm}",
+        r"\textbf{Family} & \textbf{Transforms} & \textbf{Acts on} & \textbf{Orthogonal?}",
+        [r"Orthogonal rot. & PCA, Hadamard, DCT & Input (right) & Yes \\",
+         r"Matrix decomp. & SVD (left, right, two-sided$^\dagger$), QR$^\dagger$, LU & Both & Partially \\",
+         r"Statistical & Diagonal scaling, SVD weighted & Input & No \\",
+         r"Permutation & Row sort, Column sort, Cuthill-McKee & Both & Yes (discrete) \\",
+         r"\midrule",
+         r"Learned, cross-layer$^\ddagger$ & Global $Q$, per-block $Q_i$, Haar-random $Q$"
+         r" & Stream (both sides) & Yes \\"])
+
+
+def cr_table2(root):
+    """Per-layer Delta with whole-model values in brackets."""
+    pl = os.path.join(root, "perlayer")
+    P = PerLayer(pl, CR_MODELS)
+    # Main-sweep LLaMA CSVs have no Hadamard rows; the 50% rebuttal rerun does.
+    P50 = PerLayer(pl, CR_MODELS, sub="sp50")
+    wm = {m: _wm_delta(root, m, "wanda") for m in CR_MODELS}
+    body, notes = [], []
+    for tk in TORDER:
+        if tk in TBREAKS:
+            body.append(r"\midrule")
+        cells = []
+        for m in CR_MODELS:
+            c = P.delta_mean(m, tk)
+            if c == PLACEHOLDER and P50.delta_mean(m, tk) != PLACEHOLDER:
+                c = P50.delta_mean(m, tk)
+                notes.append(f"% {m} {tk}: from perlayer/{m}/sp50 (main sweep has no rows)")
+            d, _ = wm[m]
+            if d is not None and tk in d.index:
+                c += f" ({_p2(d[tk])})"
+            cells.append(c)
+        body.append(TNAME.get(tk, tk) + " & " + " & ".join(cells) + r" \\")
+    seeds = {m: n for m, (_, n) in wm.items() if n}
+    cap = (r"Marginal contribution of pruning: $\Delta = \mathrm{zero\_rows}(T(W_\text{wanda}))"
+           r" - \mathrm{zero\_rows}(T(W_\text{dense}))$. Values are from the per-layer protocol;"
+           r" where whole-model sequential pruning was also run, those values appear in brackets"
+           r" (mean over " + ", ".join(f"{MNAME[m]}: {n} draw{'s' if n > 1 else ''}"
+                                        for m, n in seeds.items()) + r")."
+           r" Non-zero entries are driven by the single \texttt{out\_proj}/\texttt{o\_proj}"
+           r" anomaly layer (Table~\ref{tab:outproj}).")
+    cs = "l" + "r" * len(CR_MODELS)
+    return notes + _table(cap, "tab:delta", cs, r"\textbf{Transform} & " + _model_header(CR_MODELS), body)
+
+
+def _methods_frame(root, model="opt-125m"):
+    cols = {}
+    for m in ["wanda", "sparsegpt", "magnitude_perrow"]:
+        d, n = _wm_delta(root, model, m)
+        if d is not None:
+            cols[m] = d
+    return pd.DataFrame(cols)
+
+
+def _methods_header(df):
+    return r"\textbf{Transform} & " + " & ".join(
+        r"\textbf{" + {"magnitude_perrow": "Magnitude (per-row)"}.get(m, METHOD_NAME[m]) + "}"
+        for m in df.columns)
+
+
+def cr_table3(root):
+    df = _methods_frame(root)
+    rows = [("Identity", TNAME["Identity"]), ("SVD_left", TNAME["SVD_left"]),
+            ("Hadamard_right", TNAME["Hadamard_right"])]
+    body = [lab + " & " + " & ".join(_p2(df.loc[t, m]) for m in df.columns) + r" \\" for t, lab in rows]
+    mx = df.drop(index="Identity").max()
+    body += [r"\midrule", "Maximum over 13 transforms & " + " & ".join(_p2(mx[m]) for m in df.columns) + r" \\"]
+    cap = (r"Generality across per-output pruning methods: $\Delta = \mathrm{zero\_rows}(T(W_\text{pruned}))"
+           r" - \mathrm{zero\_rows}(T(W_\text{dense}))$ on OPT-125M at 50\% sparsity under whole-model"
+           r" pruning. Three representative transforms are shown: the identity baseline, the transform"
+           r" attaining the largest $\Delta$, and one orthogonal rotation standing for the remaining ten."
+           r" The final row is the maximum over all 13 transforms. Full per-transform results are in Appendix B.")
+    return _table(cap, "tab:methods", "l" + "r" * len(df.columns), _methods_header(df), body)
+
+
+def cr_a3(root):
+    df = _methods_frame(root)
+    body = []
+    for tk in TORDER:
+        body.append(TNAME.get(tk, tk) + " & " + " & ".join(_p2(df.loc[tk, m]) for m in df.columns) + r" \\")
+    mx = df.drop(index="Identity").max()
+    body += [r"\midrule", "Maximum & " + " & ".join(_p2(mx[m]) for m in df.columns) + r" \\"]
+    cap = (r"Complete per-transform $\Delta$ (exact zero rows) on OPT-125M at 50\% sparsity under"
+           r" whole-model pruning. Wanda and SparseGPT values are means over three calibration draws;"
+           r" per-row magnitude pruning is deterministic and uses a single run.")
+    return _table(cap, "tab:app_methods", "l" + "r" * len(df.columns), _methods_header(df), body)
+
+
+def cr_table5(root):
+    Q = [("global", "Global $Q$"), ("per_block", "Per-block $Q_i$"), ("random", "Haar-random $Q$")]
+    body = []
+    for method in ["wanda", "sparsegpt"]:
+        p = glob.glob(os.path.join(root, "crosslayer_q", "opt-125m", method, "sp50", "run_info.json"))
+        if not p:
+            continue
+        s = json.load(open(p[0]))["delta_summary"]
+        if body:
+            body.append(r"\midrule")
+        for i, (q, lab) in enumerate(Q):
+            first = (r"\multirow{3}{*}{" + METHOD_NAME[method] + "}") if i == 0 else ""
+            body.append(f"{first} & {lab} & " + " & ".join(
+                _p2(s[q][f"delta_{k}_mean"]) for k in ("zero_rows", "near_zero_rows", "near_zero_cols")) + r" \\")
+    cap = (r"Learned cross-layer rotations on whole-model-pruned OPT-125M at 50\% sparsity. $\Delta$ is"
+           r" measured against the same rotation applied to the dense weights. The covariance-derived"
+           r" rotations are indistinguishable from a Haar-random control on every metric.")
+    return _table(cap, "tab:crosslayer", "llrrr",
+                  r"\textbf{Pruning} & \textbf{Rotation} & $\Delta$ zero rows & $\Delta$ near-zero rows & $\Delta$ near-zero cols",
+                  body)
+
+
+def _anomaly_rows(root):
+    """Per-layer out_proj/o_proj rows with Wanda rank-drop > 10, joined to the
+    whole-model mechanism run (seed 0) where it exists. Also returns the
+    layers that pass the criterion only under whole-model pruning."""
+    P = PerLayer(os.path.join(root, "perlayer"), CR_MODELS)
+    rows, seen = [], set()
+    for m in CR_MODELS:
+        if m not in P.diag:
+            continue
+        df = P.diag[m]
+        out = df[df["layer_type"].isin(["out_proj", "o_proj"]) & (df["drop_wanda_rank_1em3"] > 10)]
+        mech = _mech(root, m)
+        for _, r in out.iterrows():
+            w = None
+            if mech is not None:
+                hit = mech[mech["layer"] == r["layer"]]
+                w = hit.iloc[0] if len(hit) else None
+            rows.append(dict(model=m, layer=r["layer"], wm_only=False, pl=r, wm=w,
+                             delta=P.layer_delta(m, r["layer"], "SVD_left")))
+            seen.add(r["layer"])
+        if mech is not None:
+            t = mech[(mech["role"] == "target") & (mech["rank_drop_1em3"] > 10)]
+            for _, w in t.iterrows():
+                if w["layer"] not in seen:
+                    rows.append(dict(model=m, layer=w["layer"], wm_only=True, pl=None, wm=w, delta=None))
+    blk = lambda r: int(r["layer"].split(".")[r["layer"].split(".").index("layers") + 1])
+    rows.sort(key=lambda r: (CR_MODELS.index(r["model"]), blk(r)))
+    return rows
+
+
+def _pair(pl, wm, fmt):
+    a = fmt(pl) if pl is not None else ""
+    b = f"({fmt(wm)})" if wm is not None else ""
+    return (a + " " + b).strip()
+
+
+def cr_table6(root):
+    body = []
+    for r in _anomaly_rows(root):
+        if r["wm_only"]:
+            continue
+        pl, w = r["pl"], r["wm"]
+        get = lambda k: None if w is None else w[k]
+        body.append(f"{MNAME[r['model']]} & {_cr_short_layer(r['layer'])} & "
+                    f"{_pair(pl['drop_wanda_rank_1em3'], get('rank_drop_1em3'), lambda v: f'{v:+.0f}')} & "
+                    f"{_pair(pl['drop_wanda_rank_1em6'], get('rank_drop_1em6'), lambda v: f'{v:+.0f}')} & "
+                    f"{_pair(pl['mask_corr_wanda'], get('rho_M'), lambda v: f'{v:.3f}')} & "
+                    f"{r['delta']}" + (f" ({w['delta_svdleft_zero_rows']*100:+.1f}\\%)" if w is not None else "")
+                    + r" \\")
+    cap = (r"\texttt{out\_proj}/\texttt{o\_proj} layers with genuine rank-drop $>10$. Values are from the"
+           r" per-layer protocol, with whole-model sequential pruning in brackets. Spectral and"
+           r" effective-rank diagnostics are in Appendix C.")
+    return _table(cap, "tab:outproj", "llrrrr",
+                  r"\textbf{Model} & \textbf{Layer} & \multicolumn{2}{c}{\textbf{rank-drop}} & $\rho(M)$ & $\Delta$",
+                  body, [r"\cmidrule(lr){3-4}", r" & & $10^{-3}$ & $10^{-6}$ & & (SVD-left) \\"])
+
+
+def cr_a4(root):
+    body = []
+    for r in _anomaly_rows(root):
+        pl, w = r["pl"], r["wm"]
+        get = lambda k: None if w is None else w[k]
+        plg = lambda k: None if pl is None else pl[k]
+        mn = MNAME[r["model"]] + (r"$^\dagger$" if r["wm_only"] else "")
+        body.append(f"{mn} & {_cr_short_layer(r['layer'], 'l.')} & "
+                    f"{_pair(plg('drop_wanda_rank_1em3'), get('rank_drop_1em3'), lambda v: f'{v:+.0f}')} & "
+                    f"{_pair(plg('drop_wanda_rank_1em6'), get('rank_drop_1em6'), lambda v: f'{v:+.0f}')} & "
+                    f"{_pair(plg('mask_corr_wanda'), get('rho_M'), lambda v: f'{v:.3f}')} & "
+                    f"{_pair(plg('wanda_top10_ratio'), get('R10'), lambda v: f'{v:.3f}')} \\\\")
+    cap = (r"Rank and spectral diagnostics for \texttt{out\_proj}/\texttt{o\_proj} layers with rank-drop"
+           r" $>10$. Per-layer protocol, with whole-model sequential pruning in brackets. Rows marked"
+           r" $^\dagger$ reach the criterion only under whole-model pruning. Transform results for the"
+           r" same layers are in Table~\ref{tab:app_outproj_delta}.")
+    return _table(cap, "tab:app_outproj_diag", "llrrrr",
+                  r"\textbf{Model} & \textbf{Layer} & \multicolumn{2}{c}{\textbf{rank-drop}} & $\rho(M)$ & $R_{10}$",
+                  body, [r"\cmidrule(lr){3-4}", r" & & $10^{-3}$ & $10^{-6}$ & & \\"])
+
+
+def cr_a5(root):
+    body = []
+    for r in _anomaly_rows(root):
+        pl, w = r["pl"], r["wm"]
+        erd = "---" if pl is None else f"{pl['eff_rank_wanda'] - pl['eff_rank_dense']:+.0f}"
+        wd = f"({w['delta_svdleft_zero_rows']*100:+.1f}\\%)" if w is not None else ""
+        mn = MNAME[r["model"]] + (r"$^\dagger$" if r["wm_only"] else "")
+        body.append(f"{mn} & {_cr_short_layer(r['layer'], 'l.')} & {erd} & "
+                    f"{((r['delta'] or '') + ' ' + wd).strip()} \\\\")
+    cap = (r"Effective-rank change and marginal contribution under SVD-left for the layers of"
+           r" Table~\ref{tab:app_outproj_diag}. Effective rank is the entropy of the normalised"
+           r" singular-value distribution; it was not recomputed under the whole-model protocol.")
+    return _table(cap, "tab:app_outproj_delta", "llrr",
+                  r"\textbf{Model} & \textbf{Layer} & \textbf{eff-rank change} & $\Delta$ (SVD-left)", body)
+
+
+def cr_a1(root):
+    # Same computation as t_appendix (see the note there); the camera-ready
+    # table omits the 10^-5 row, which the sensitivity sweep never produced.
+    P = PerLayer(os.path.join(root, "perlayer"), CR_MODELS)
+    L = t_appendix(P)
+    L = [l for l in L if not l.lstrip().startswith(r"& $10^{-5}$")]
+    i = L.index(r"\begin{table}[ht]")
+    return L[i:]
+
+
+def cr_a6(root):
+    p = os.path.join(root, "synthetic", "synthetic_mechanism_ablation_summary.csv")
+    df = pd.read_csv(p).set_index(["mask", "spectrum", "rank"])
+    ROWS = [("indep", "flat", "Independent"), ("indep", "concentrated", "Independent"),
+            ("group_32", "flat", "Groups, $G{=}32$"), ("group_8", "flat", "Groups, $G{=}8$"),
+            ("group_2", "flat", "Groups, $G{=}2$"), ("group_2", "concentrated", "Groups, $G{=}2$"),
+            ("colshare_0.10", "flat", "Shared cols, $c{=}0.10$"),
+            ("colshare_0.25", "flat", "Shared cols, $c{=}0.25$"),
+            ("colshare_0.40", "flat", "Shared cols, $c{=}0.40$")]
+    body = []
+    for mask, spec, lab in ROWS:
+        r = df.loc[(mask, spec, "full")]
+        d = r["delta_svdleft_rows"] * 100
+        body.append(f"{lab} & {spec} & {r['rho_M']:.3f} & {r['rank_drop']:.1f} & {r['R10']:.3f} & "
+                    + ("0.0\\%" if abs(d) < 0.05 else f"{d:+.1f}\\%") + r" \\")
+    cap = (r"Synthetic factorial, full-rank dense matrices. Structure is recovered only when mask"
+           r" correlation forces rank collapse, and then in the amount of the imposed violation."
+           r" The $G{=}8$ row isolates correlation without rank consequence.")
+    return _table(cap, "tab:synthetic", "llrrrr",
+                  r"\textbf{Mask} & \textbf{Spectrum} & $\rho(M)$ & rank-drop & $R_{10}$ & $\Delta$", body)
+
+
+def cr_a7(root):
+    ROLE = {"target": "target", "shape_control": "shape control", "write_control": "write control"}
+    body = []
+    for m in ["llama-7b", "opt-125m"]:
+        p = os.path.join(root, "oproj_mechanism", m, "wanda", "sp50", "summary_by_layer_type.csv")
+        if not os.path.exists(p):
+            continue
+        df = pd.read_csv(p)
+        df = df.assign(_o=df["role"].map({"target": 0, "shape_control": 1, "write_control": 2})).sort_values("_o")
+        if body:
+            body.append(r"\midrule")
+        for i, (_, r) in enumerate(df.iterrows()):
+            body.append(f"{MNAME[m] if i == 0 else ''} & {r['layer_type'].replace('_', chr(92) + '_')} & "
+                        f"{ROLE[r['role']]} & {r['xn_across_head_share']:.3f} & {r['rho_M']:.3f} & "
+                        f"{_half_up(r['rank_drop_1em3'], 1):+} & {_p2(r['delta_svdleft_zero_rows'])} \\\\"
+                        .replace("+0.0 ", "0.0 "))
+    cap = (r"Layer-type comparison under whole-model pruning. All values are means over every block"
+           r" of that layer type, so the target rows understate the anomaly (Table~\ref{tab:app_depth})."
+           r" Head-block structure in the activation statistics is present only at the output"
+           r" projection, and only there do the three properties fail.")
+    return _table(cap, "tab:app_layertype", "lllrrrr",
+                  r"\textbf{Model} & \textbf{Layer} & \textbf{Role} & across-head & $\rho(M)$ & rank-drop & $\Delta$",
+                  body)
+
+
+def cr_a8(root, model="llama-7b"):
+    mech = _mech(root, model)
+    t = mech[mech["role"] == "target"].sort_values("block_idx")
+    nb = int(t["block_idx"].max()) + 1
+
+    def row(label, s):
+        dead = int(round((s["frac_heads_mostly_dead"] * s["n_heads"]).max()))
+        rd = s["rank_drop_1em3"].mean()
+        return (f"{label} & {s['xn_across_head_share'].mean():.3f} & {dead}/{int(s['n_heads'].iloc[0])} & "
+                f"{s['rho_M'].mean():.3f} & {_half_up(rd, 0 if len(s) == 1 else 1):+} & "
+                f"{_p2(round(s['delta_svdleft_zero_rows'].mean(), 4))} \\\\")
+    body = [row(str(b), t[t["block_idx"] == b]) for b in (0, 1, 2)]
+    body.append(row(f"3--{nb//2 - 1} (mean)", t[(t["block_idx"] >= 3) & (t["block_idx"] < nb // 2)]))
+    body.append(row(f"{nb//2}--{nb-1} (mean)", t[t["block_idx"] >= nb // 2]))
+    cap = (r"Depth profile of " + MNAME[model] + r" \texttt{o\_proj}. Dead heads, not head-block"
+           r" heterogeneity, track the anomaly: the across-head share rises with depth while the"
+           r" anomaly disappears after block 1.")
+    return _table(cap, "tab:app_depth", "lrrrrr",
+                  r"\textbf{Block} & across-head & dead heads & $\rho(M)$ & rank-drop & $\Delta$", body)
+
+
+def cr_perlayer(fn):
+    return lambda root: fn(PerLayer(os.path.join(root, "perlayer"), CR_MODELS))
+
+
+CAMERA_READY = OrderedDict([
+    ("table1", ("static      transformations evaluated", cr_table1, "")),
+    ("table2", ("perlayer+wm main Delta across scales, whole-model in brackets", cr_table2, "perlayer wholemodel")),
+    ("table3", ("wholemodel  generality across pruning methods (OPT-125M)", cr_table3, "wholemodel")),
+    ("table4", ("perlayer    dense zero rows of QR / SVD two-sided", cr_perlayer(t_qrsvd), "perlayer")),
+    ("table5", ("crosslayer  learned cross-layer rotations", cr_table5, "crosslayer_q")),
+    ("table6", ("perlayer+wm out_proj/o_proj anomaly layers", cr_table6, "perlayer oproj_mechanism")),
+    ("table7", ("perlayer    rank-drop, hi90, R10, rho(M) diagnostics", cr_perlayer(t_diagnostics), "perlayer")),
+    ("a1",     ("perlayer    all metrics x thresholds", cr_a1, "perlayer")),
+    ("a2",     ("HARDCODED   pre-pruning rotation (source scripts missing)", lambda root: t_rotation(None), "")),
+    ("a3",     ("wholemodel  complete per-transform Delta x method", cr_a3, "wholemodel")),
+    ("a4",     ("perlayer+wm out_proj rank / spectral diagnostics", cr_a4, "perlayer oproj_mechanism")),
+    ("a5",     ("perlayer+wm out_proj eff-rank change and Delta", cr_a5, "perlayer oproj_mechanism")),
+    ("a6",     ("synthetic   synthetic factorial, full-rank cells", cr_a6, "synthetic")),
+    ("a7",     ("oproj       layer-type comparison (Wanda)", cr_a7, "oproj_mechanism")),
+    ("a8",     ("oproj       LLaMA-7B o_proj depth profile", cr_a8, "oproj_mechanism")),
+])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 TABLES = OrderedDict([
     ("paper",        "perlayer   all main-paper per-layer tables (= paper_tables.tex)"),
     ("transforms",   "static     Table 1, transformation families"),
@@ -813,10 +1182,16 @@ TABLES = OrderedDict([
     ("oproj_mechanism","oproj    out_proj anomaly mechanism"),
     ("synthetic",    "synthetic  synthetic three-mechanism factorial"),
     ("all",          "every table whose inputs exist, from the default results/ layout"),
+    ("camera_ready", "every camera-ready table below, in paper order (reads --results_root)"),
 ])
+for _k, (_d, _, _) in CAMERA_READY.items():
+    TABLES[_k] = "camera-ready " + _d
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--table", default="all", choices=list(TABLES))
+parser.add_argument("--results_root", default=RES,
+                    help="camera-ready tables: root holding perlayer/, wholemodel/, crosslayer_q/, "
+                         "oproj_mechanism/, synthetic/ (default: results/)")
 parser.add_argument("--results_dir", default=None,
                     help="default depends on --table: results/{perlayer,wholemodel,crosslayer_q,oproj_mechanism,synthetic}")
 parser.add_argument("--schema", choices=["auto", "perlayer", "wholemodel"], default="auto")
@@ -836,9 +1211,22 @@ DEFAULT_DIR = {"crosslayer": "crosslayer_q", "oproj_mechanism": "oproj_mechanism
 
 
 def build(table, results_dir=None):
+    if table in CAMERA_READY:
+        return CAMERA_READY[table][1](args.results_root)
+    if table == "camera_ready":
+        L = []
+        for k, (_, fn, needs) in CAMERA_READY.items():
+            missing = [d for d in needs.split() if not os.path.isdir(os.path.join(args.results_root, d))]
+            if missing:
+                print(f"  skip {k}: no {', '.join(missing)}/ under {args.results_root}", file=sys.stderr)
+                continue
+            L += [f"% ===== {k} =====", ""] + fn(args.results_root)
+        return L
     rd = results_dir or os.path.join(RES, DEFAULT_DIR.get(table, "perlayer"))
     if table in ("transforms",):
         return t_transforms(None)
+    if table == "rotation":   # hard-coded values, no CSV needed
+        return t_rotation(None)
     if table in ("crosslayer", "oproj_mechanism", "synthetic"):
         return {"crosslayer": t_crosslayer, "oproj_mechanism": t_oproj_mechanism,
                 "synthetic": t_synthetic}[table](rd)

@@ -106,6 +106,19 @@ def test_no_cholesky_reference_in_code():
                     assert not pat.search(src), f"Cholesky mention in {f}"
 
 
+def test_camera_ready_tables_render_from_committed_sample():
+    import subprocess
+    gen = os.path.join(REPO, "analysis", "generate_tables.py")
+    run = lambda t: subprocess.run([sys.executable, gen, "--table", t, "--results_root",
+                                    os.path.join(REPO, "results", "sample"), "--out", "-"],
+                                   capture_output=True, text=True, check=True).stdout
+    t3 = run("table3")   # camera-ready Table 3: Wanda / SparseGPT / per-row magnitude
+    assert r"Maximum over 13 transforms & +0.33\% & +0.20\% & +0.04\%" in t3
+    assert r"SVD left ($U^\top$) & +0.33\% & +0.06\% & +0.03\%" in t3
+    a6 = run("a6")       # camera-ready Table A6, synthetic factorial
+    assert r"Groups, $G{=}2$ & flat & 0.527 & 125.0 & 1.144 & +24.2\%" in a6
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):
