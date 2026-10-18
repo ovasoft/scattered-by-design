@@ -32,10 +32,10 @@ LLaMA-7B at 50% sparsity reproduces the published WikiText-2 perplexity:
 ```bash
 pip install -r requirements.txt     # pinned; see Setup
 
-# 1. No GPU, seconds: render the whole-model method table from the committed sample
-python analysis/generate_tables.py --table methods --results_dir results/sample/wholemodel
+# 1. No GPU, seconds: render Table 3 (pruning methods) from the committed sample
+python analysis/generate_tables.py --table table3 --results_root results/sample
 
-# 2. One GPU, ~20 min: recompute the OPT-125M whole-model Wanda result from scratch
+# 2. One GPU, ~5 min: recompute the OPT-125M whole-model Wanda result from scratch
 python experiments/run_wholemodel_experiments.py --models opt-125m --methods wanda --sparsity 0.5 --seeds 0
 cat results/wholemodel/opt-125m/wanda/sp50/seed0/delta_per_transform.csv
 ```
@@ -98,15 +98,16 @@ Hardware: NVIDIA RTX A6000 (48 GB), driver 580.65.06.
 
 ## Hardware and runtime
 
-One RTX A6000 48 GB (wall-clock times from the original runs):
+One RTX A6000 48 GB. Times marked (m) were measured for this release; the
+others are read from the original result-file timestamps.
 
 | Experiment | Script | Runtime |
 |---|---|---|
-| Smoke test (all three checks) | `scripts/smoke_test.sh` | RUNTIME_SMOKE |
-| Synthetic factorial (CPU only) | `experiments/synthetic_mechanism_ablation.py` | RUNTIME_SYNTH |
-| Per-layer main sweep, OPT-125M | `experiments/run_experiments.py` | RUNTIME_PERLAYER_OPT125M |
+| Smoke test (all three checks) | `scripts/smoke_test.sh` | ≈ 10 min (m) |
+| Synthetic factorial (CPU only) | `experiments/synthetic_mechanism_ablation.py` | ≈ 1 min, 8 BLAS threads (m) |
+| Per-layer main sweep, OPT-125M | `experiments/run_experiments.py` | ≈ 5.5 min (m) |
 | Per-layer rebuttal, OPT-1.3B, one sparsity, with SparseGPT | `experiments/run_experiments_rebuttal.py` | ≈ 3 h 50 min |
-| Whole-model, OPT-125M, one method × seed | `experiments/run_wholemodel_experiments.py` | ≈ 18–20 min |
+| Whole-model, OPT-125M, Wanda, one seed | `experiments/run_wholemodel_experiments.py` | ≈ 4.5 min (m); SparseGPT and `--eval_ppl` add to this |
 | Whole-model, LLaMA-7B (fp16) | `experiments/run_wholemodel_experiments.py` | fits in 48 GB; time not recorded |
 | Cross-layer Q, OPT-125M, one method | `experiments/run_crosslayer_q.py` | ≈ 2–3 min |
 | out_proj mechanism, OPT-125M, one method | `experiments/run_oproj_mechanism.py` | ≈ 2 min |
@@ -127,18 +128,19 @@ src/pruning_transforms/  single source of truth, imported by every experiment
   pruning.py             per-layer pruners, Wanda scaler, per-layer SparseGPT, official-code import
   config.py              thresholds and constants (do not change), model registry, 10-bin sampling
 experiments/
-  run_experiments.py             per-layer protocol, main sweep (Tables 2, 4)
-  run_experiments_rebuttal.py    per-layer protocol + per-layer SparseGPT + sparsity sweep
-  run_wholemodel_experiments.py  whole-model protocol (official code); --seeds, --truncate_oproj, --eval_ppl
-  run_crosslayer_q.py            SliceGPT-style cross-layer rotation (E2)
-  run_oproj_mechanism.py         per-head analysis of the out_proj anomaly, with controls (E4)
+  run_experiments.py             per-layer protocol, main sweep (Tables 2, 4, 6, 7, A1; Fig. 2)
+  run_experiments_rebuttal.py    per-layer protocol + per-layer SparseGPT + 50-80% sparsity sweep
+  run_wholemodel_experiments.py  whole-model protocol (official code; Tables 3, A3); --seeds, --truncate_oproj, --eval_ppl
+  run_crosslayer_q.py            SliceGPT-style learned cross-layer rotation (Table 5)
+  run_oproj_mechanism.py         per-head analysis of the out_proj anomaly, with controls (Tables A7, A8)
   check_dead_heads.py            dead-head count behind the out_proj anomaly (prints only)
-  synthetic_mechanism_ablation.py  synthetic three-mechanism factorial, CPU only (E5)
+  synthetic_mechanism_ablation.py  synthetic three-mechanism factorial, CPU only (Table A6)
 analysis/
-  generate_tables.py     every LaTeX table, from CSVs only, both schemas
-  generate_figures.py    Section 5 figures, from per-layer CSVs
+  generate_tables.py     every LaTeX table, from CSVs only (--table camera_ready: Tables 1-7, A1-A8)
+  generate_figures.py    Fig. 2 (R10 vs depth) plus exploratory figures, from per-layer CSVs
 scripts/smoke_test.sh    end-to-end check of both protocols
-paper/PROVENANCE.md      table/figure -> command map
+paper/PROVENANCE.md      camera-ready table/figure -> command map
+paper/*.pdf              the camera-ready paper
 results/                 outputs (gitignored), except results/sample/ (committed)
 tests/                   unit tests of the shared library
 ```
@@ -195,7 +197,7 @@ deliberately kept separate.
   - Each analysed layer is pruned in isolation.
   - Calibration statistics (Wanda scalers; the SparseGPT Hessian) come from
     one forward pass of the **dense** model: 128 C4 sequences of 128 tokens.
-  - This produced the main sweep across model scales (Tables 2 and 4).
+  - This produced the main sweep across model scales (Tables 2, 4, 6 and 7).
 - **Whole-model** (`run_wholemodel_experiments.py`, also `run_crosslayer_q.py`
   and `run_oproj_mechanism.py`):
   - Pruning is delegated to the official `locuslab/wanda` code.

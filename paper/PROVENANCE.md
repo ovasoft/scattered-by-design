@@ -1,48 +1,81 @@
-# Provenance: paper table / figure → command
+# Provenance: camera-ready table / figure → command
 
-For every table and figure: the command that produces its CSVs, where they
-land, the command that renders it, and the observed runtime. Every render
-reads CSVs only (no GPU). Run all commands from the repository root.
+For every table and figure in the camera-ready paper
+(`paper/Scattered_by_Design__Why_Per_Output_Pruning_Resists_Structured_Compression___camera_ready.pdf`):
+the command that produces its CSVs, where they land, and the command that
+renders it. Rendering reads CSVs only (no GPU). Run everything from the
+repository root.
 
 Each entry names its **protocol**:
 
 - **per-layer**: every analysed layer is pruned in isolation, with
-  calibration statistics from the dense model.
+  calibration statistics from the dense model (`experiments/run_experiments*.py`).
 - **whole-model**: the official Wanda/SparseGPT code prunes the whole model
-  sequentially.
+  sequentially (`experiments/run_wholemodel_experiments.py` and the scripts
+  built on it).
 
-Table numbers given in REPRODUCIBILITY_TASK.md are used. The other tables
-are identified by their LaTeX `\label`. TODO (authors): fill in the
-camera-ready numbers.
+The experiment scripts write under one results root:
 
-Runtimes are wall-clock times read from the original result-file timestamps
-(one RTX A6000 48 GB), unless marked as measured in this release.
+```
+results/perlayer/{model}/                         per-layer main sweep
+results/perlayer/{model}/sp{50,60,70,80}/         per-layer rebuttal sweep
+results/wholemodel/{model}/{method}/sp50/seed{S}/ whole-model runs
+results/crosslayer_q/{model}/{method}/sp50/       learned cross-layer rotations
+results/oproj_mechanism/{model}/{method}/sp50/    out_proj anomaly mechanism
+results/synthetic/                                synthetic factorial
+```
+
+Render every camera-ready table at once (tables whose inputs are missing are
+skipped with a message):
+
+```
+python analysis/generate_tables.py --table camera_ready --out paper/tables.tex
+python analysis/generate_tables.py --table camera_ready --results_root results/sample   # committed sample only
+```
+
+Each table can also be rendered on its own with `--table table1` … `table7`,
+`a1` … `a8`. All of them were rendered from the original research CSVs on
+2026-10-18 and compared cell by cell with the camera-ready PDF. They match
+except where an entry below says otherwise.
+
+Runtimes are wall-clock on one RTX A6000 48 GB. "Measured" means measured in
+this release; the others are read from the original result-file timestamps.
 
 ---
 
-### Table 1: transformations evaluated (`tab:transforms`)
-- data: none (static; lists the 13 transforms in `src/pruning_transforms/transforms.py`)
-- render: `python analysis/generate_tables.py --table transforms`
+## Main paper
 
-### Table 2: main Δ across model scales (`tab:delta`). **Per-layer protocol**
+### Figure 1: transformation schematic
+- Conceptual illustration, no data.
+
+### Table 1: transformations evaluated (`tab:transforms`)
+- data: none (lists the 13 transforms in `src/pruning_transforms/transforms.py`
+  and the three cross-layer variants in `experiments/run_crosslayer_q.py`)
+- render: `python analysis/generate_tables.py --table table1`
+- note: the PDF marks SVD *left* with †. Tables 2 and 4 mark SVD *two-sided*,
+  which is the variant that yields zero rows on any matrix, and the generator
+  follows them.
+
+### Table 2: Δ across model scales (`tab:delta`). **Per-layer**, whole-model in brackets
 - data:
   ```
   python experiments/run_experiments.py --models opt-125m opt-1.3b opt-6.7b llama-7b llama-13b
+  python experiments/run_experiments_rebuttal.py --models llama-7b --sparsity 0.5     # Hadamard cell, see note
+  python experiments/run_wholemodel_experiments.py --models opt-125m --methods wanda --sparsity 0.5 --seeds 0 1 2
+  python experiments/run_wholemodel_experiments.py --models llama-7b --methods wanda --sparsity 0.5 --seeds 0 \
+      --truncate_oproj 1 --eval_ppl
   ```
-- file: `results/perlayer/{model}/transform_results.csv`
-- render: `python analysis/generate_tables.py --table delta --models opt-125m opt-1.3b opt-6.7b llama-7b llama-13b`
-- runtime: OPT-125M: RUNTIME_PERLAYER_OPT125M (measured in this release, smoke test); larger models take hours (CPU-side LU/PCA dominate)
-- note: the per-layer LLaMA-7B/13B main-sweep CSVs have no `Hadamard_right`
-  rows. The original script crashed on Hadamard (README §Corrections 5), so
-  those cells render as `[X]`. LLaMA-7B Hadamard was later computed in the
-  rebuttal run (`results/perlayer/llama-7b/sp50/`, Δ = 0.0). LLaMA-13B
-  Hadamard was never computed and is left empty.
+- file: `results/perlayer/{model}/transform_results.csv`;
+  brackets: `results/wholemodel/{opt-125m,llama-7b}/wanda/sp50/seed*/delta_per_transform.csv`
+- render: `python analysis/generate_tables.py --table table2`
+- runtime: per-layer OPT-125M ≈ 5.5 min (measured); larger models take hours
+  (CPU-side LU/PCA dominate). Whole-model OPT-125M ≈ 4.5 min per seed (measured).
+- note: the main-sweep LLaMA CSVs have no `Hadamard_right` rows. The
+  generator takes the LLaMA-7B cell from `results/perlayer/llama-7b/sp50/`
+  (0.0%) and marks this in a LaTeX comment. No LLaMA-13B Hadamard result
+  exists, so that cell renders `[X]` (the PDF prints 0.0%).
 
-### Table 2b: dense zero rows of QR / SVD two-sided (`tab:qrsvd`). **Per-layer protocol**
-- data/file: same as Table 2
-- render: `python analysis/generate_tables.py --table qrsvd --models ...`
-
-### Table 3: generality across pruning methods. **Whole-model protocol**
+### Table 3: generality across pruning methods (`tab:methods`). **Whole-model**
 - data:
   ```
   python experiments/run_wholemodel_experiments.py --models opt-125m \
@@ -51,106 +84,116 @@ Runtimes are wall-clock times read from the original result-file timestamps
       --methods magnitude_perrow --sparsity 0.5 --seeds 0      # deterministic, one seed
   ```
 - file: `results/wholemodel/opt-125m/{method}/sp50/seed{0,1,2}/delta_per_transform.csv`
-- render: `python analysis/generate_tables.py --table methods --results_dir results/wholemodel --model opt-125m`
-  (`--results_dir results/sample/wholemodel` renders the committed sample)
-- runtime: ≈ 18–20 min per (method, seed) for OPT-125M
+- render: `python analysis/generate_tables.py --table table3`
+- runtime: ≈ 4.5 min per (method, seed) for Wanda (measured); SparseGPT is slower
 
-### Table 4: rank / spectral / mask-correlation diagnostics across scales (`tab:diagnostics`). **Per-layer protocol**
-- data/file: as Table 2, `results/perlayer/{model}/layer_diagnostics.csv`
-- render: `python analysis/generate_tables.py --table diagnostics --models ...`
+### Table 4: dense zero rows of QR / SVD two-sided (`tab:qrsvd`). **Per-layer**
+- data/file: as Table 2
+- render: `python analysis/generate_tables.py --table table4`
 
-### Column-sparsity table: Δ(zero_cols) per transform × method. **Whole-model protocol**
-- data/file: as Table 3
-- render: `python analysis/generate_tables.py --table colsparsity --results_dir results/wholemodel --model opt-125m`
-
-### Calibration-seed variance (E1). **Whole-model protocol**
-- data: as Table 3 (seeds 0 1 2). The script also writes `results/wholemodel/seed_variance_summary.csv`.
-- render: `python analysis/generate_tables.py --table seeds --results_dir results/wholemodel`
-
-### out_proj anomaly table (`tab:outproj`). **Per-layer protocol**
-- data/file: as Table 2. It reports the `out_proj`/`o_proj` rows with rank drop > 10.
-- render: `python analysis/generate_tables.py --table outproj --models ...`
-
-### out_proj anomaly mechanism (E4). **Whole-model protocol**
-- data:
-  ```
-  python experiments/run_oproj_mechanism.py --models opt-125m --methods wanda sparsegpt --sparsity 0.5
-  python experiments/run_oproj_mechanism.py --models llama-7b --methods wanda --sparsity 0.5 --dtype float16
-  ```
-- file: `results/oproj_mechanism/{model}/{method}/sp50/{layer_mechanism,per_head_detail,summary_by_layer_type,target_depth_trend}.csv`
-- render: `python analysis/generate_tables.py --table oproj_mechanism`
-- supporting check (dead heads, prints only): `python experiments/check_dead_heads.py`
-
-### Row-deletion result (E3) and perplexity check. **Whole-model protocol**
-- data:
-  ```
-  python experiments/run_wholemodel_experiments.py --models llama-7b --methods wanda \
-      --sparsity 0.5 --seeds 0 --truncate_oproj 1 --eval_ppl
-  ```
-- file: `results/wholemodel/llama-7b/wanda/sp50/seed0/run_info.json`
-  (`ppl_wikitext2_pruned` = 7.2568, `ppl_wikitext2_truncated` = 7.2570,
-  `truncate_oproj.rows_deleted` = 618)
-- render: `python analysis/generate_tables.py --table ppl --results_dir results/wholemodel`
-- runtime: not recorded (the original run left only end-of-run timestamps)
-
-### Per-row magnitude out_proj control. **Whole-model protocol**
-- data/file: Table 3's `magnitude_perrow` run, `transform_results.csv` + `layer_diagnostics.csv`
-- render: `python analysis/generate_tables.py --table outproj_perrow --results_dir results/wholemodel`
-  (this was `rock.py` in the research directory. Its Δ line printed `nan`, see README.)
-
-### Cross-layer rotation table (E2). **Whole-model protocol**
+### Table 5: learned cross-layer rotations (`tab:crosslayer`). **Whole-model**
 - data:
   ```
   python experiments/run_crosslayer_q.py --models opt-125m --methods wanda sparsegpt \
       --sparsity 0.5 --seed 0 --q_modes global per_block random
   ```
-- file: `results/crosslayer_q/opt-125m/{method}/sp50/{run_info.json,delta_{global,per_block,random}.csv}`
-- render: `python analysis/generate_tables.py --table crosslayer`
+- file: `results/crosslayer_q/opt-125m/{method}/sp50/run_info.json`
+- render: `python analysis/generate_tables.py --table table5`
+- also: the 40.8% dead-column figure in Section 7 is the `near_zero_cols`
+  max in the same file (`python analysis/generate_tables.py --table crosslayer`
+  prints means with maxima in parentheses).
 
-### Synthetic three-mechanism factorial (E5). CPU only, no model
-- data: `python experiments/synthetic_mechanism_ablation.py`
-- file: `results/synthetic/synthetic_mechanism_ablation_summary.csv` (and `_raw.csv`, `e5_part_*.csv`)
-- render: `python analysis/generate_tables.py --table synthetic`
-  (`--results_dir results/sample/synthetic` renders the committed sample)
-- note: the original outputs were never saved. The committed sample was
-  produced by this release's code on 2026-10-18.
-
-### Rebuttal tables: sparsity ablation, Wanda vs SparseGPT, out_proj vs SparseGPT. **Per-layer protocol**
-- data:
+### Table 6: out_proj/o_proj anomaly layers (`tab:outproj`). **Per-layer**, whole-model in brackets
+- data: as Table 2 (per-layer), plus
   ```
-  python experiments/run_experiments_rebuttal.py --models opt-1.3b --sparsity 0.5 0.6 0.7 0.8
-  python experiments/run_experiments_rebuttal.py --models opt-125m llama-7b --sparsity 0.5
+  python experiments/run_oproj_mechanism.py --models opt-125m --methods wanda sparsegpt --sparsity 0.5
+  python experiments/run_oproj_mechanism.py --models llama-7b --methods wanda --sparsity 0.5 --dtype float16
   ```
-- file: `results/perlayer/{model}/sp{50,60,70,80}/transform_results.csv`, `layer_diagnostics.csv`
-- render: `python analysis/generate_tables.py --table rebuttal --models opt-125m opt-1.3b`
-- runtime: ≈ 3 h 50 min per sparsity level for OPT-1.3B with SparseGPT
-- note: `rebuttal_tables.tex` in the research directory was generated on
-  2026-06-19, *before* the 2026-06-22..24 reruns that produced these CSVs.
-  It is stale. Regenerate rather than copy it.
+- file: `results/perlayer/{model}/{layer_diagnostics,transform_results}.csv`;
+  brackets: `results/oproj_mechanism/{model}/wanda/sp50/layer_mechanism.csv` (seed 0)
+- render: `python analysis/generate_tables.py --table table6`
 
-### Pre-pruning rotation table (`tab:rotation`). **Not reproducible**
-- data: produced by `test_hypothesis.py` / `test_hypothesis_v2.py`, which are
-  not in this repository and were not found anywhere on the authors' machine.
-  The generator prints the hard-coded values with a warning comment.
-- render: `python analysis/generate_tables.py --table rotation`
+### Table 7: diagnostic metrics (`tab:diagnostics`). **Per-layer**
+- data/file: as Table 2, `results/perlayer/{model}/layer_diagnostics.csv`
+- render: `python analysis/generate_tables.py --table table7`
+- also: the random-mask ρ(M) range 0.011–0.026 quoted in Sections 5.3/6.3 is
+  the per-model mean of `mask_corr_random` in the same files.
 
-### Appendix A1: all metrics × thresholds (`tab:app_metrics`). **Per-layer protocol**
-- data/file: as Table 2, plus `results/perlayer/{model}/sensitivity.csv`
-- render: `python analysis/generate_tables.py --table appendix --models ...`
-- note: the threshold rows compare different thresholds for the pruned and
-  dense sides (the dense side is stored only at 1e-6), and the 1e-5 row is
-  not in the sweep. Reproduced as published.
-
-### Figures 1–5 (Section 5). **Per-layer protocol**
+### Figure 2: R10 across normalised depth. **Per-layer**
 - data/file: as Table 2
 - render: `python analysis/generate_figures.py --models opt-125m opt-1.3b opt-6.7b llama-7b llama-13b`
-  - Fig. 1 `figures/fig1_rank_drop.png`: rank drop across thresholds
-  - **Fig. 2 `figures/fig2_spectral.png`: spectral figure** (R10 vs normalised depth)
-  - Fig. 3 `figures/fig3_mask_corr.png`: ρ(M) Wanda vs random vs magnitude
-  - Fig. 4 `figures/fig4_diagnostic.png`: rank drop / R10 vs max Δ
-  - Fig. 5 `figures/fig5_heatmap.png`: mean Δ per transform × layer type
+  → `figures/fig2_spectral.png` (regenerated image is identical to the PDF's).
+  The script also writes four exploratory figures that are not in the paper.
 
-### Everything at once
-```
-python analysis/generate_tables.py --table all --out paper/tables.tex
-```
+### In-text numbers
+- **LLaMA-7B perplexity 7.257 / 7.2568 → 7.2570, 618 rows deleted, rank 3478**
+  (Sections 4.1, 5.2). Whole-model, from Table 2's LLaMA-7B command.
+  File `results/wholemodel/llama-7b/wanda/sp50/seed0/run_info.json`. Render:
+  `python analysis/generate_tables.py --table ppl`. The 28.5M vs 16.8M
+  storage figure is 3478·(4096+4096) vs 4096².
+- **Seed std ≤ 1.3×10⁻⁴** (Table 2 caption). From
+  `results/wholemodel/seed_variance_summary.csv`, written by the whole-model
+  script. Render: `python analysis/generate_tables.py --table seeds`.
+- **SparseGPT out_proj rank-drop +12.0 → +0.5, Δ +1.5% → +0.07%** (Section 6.5).
+  From `results/oproj_mechanism/opt-125m/{wanda,sparsegpt}/sp50/summary_by_layer_type.csv`.
+  Render: `python analysis/generate_tables.py --table oproj_mechanism`.
+- **Head-identity share up to 0.92 at out_proj; 23.6% dead columns in block 1**
+  (Section 6.5, Appendix E). From
+  `results/oproj_mechanism/llama-7b/wanda/sp50/layer_mechanism.csv`
+  (`xn_across_head_share`, `frac_dead_cols`).
+- **Sparsity sweep 50–80% on OPT-1.3B** (Section 4.1, Appendix F). **Per-layer**:
+  ```
+  python experiments/run_experiments_rebuttal.py --models opt-1.3b --sparsity 0.5 0.6 0.7 0.8
+  ```
+  File `results/perlayer/opt-1.3b/sp{50,60,70,80}/`. Render:
+  `python analysis/generate_tables.py --table rebuttal --models opt-1.3b`.
+  Runtime ≈ 3 h 50 min per sparsity level with SparseGPT.
+
+## Appendix
+
+### Table A1: all metrics × thresholds (`tab:app_metrics`). **Per-layer**
+- data/file: as Table 2, plus `results/perlayer/{model}/sensitivity.csv`
+- render: `python analysis/generate_tables.py --table a1`
+- note: the Exact-rows rows at 10⁻³/10⁻⁴ compare pruned zero rows at that
+  threshold with dense zero rows at 10⁻⁶ (only the 10⁻⁶ dense value is
+  stored). Averages run over all 14 rows per layer, i.e. the 13 transforms
+  plus Identity. The "fully zero" 4×4 blocks are blocks that are ≥ 90% zero.
+
+### Table A2: pre-pruning rotation (`tab:rotation`). **Not reproducible from CSVs**
+- data: produced by `test_hypothesis.py` / `test_hypothesis_v2.py`, which are
+  not in this repository. The generator prints the published values with a
+  warning comment.
+- render: `python analysis/generate_tables.py --table a2`
+
+### Table A3: complete per-transform Δ × method (`tab:app_methods`). **Whole-model**
+- data/file: as Table 3
+- render: `python analysis/generate_tables.py --table a3`
+
+### Tables A4 and A5: out_proj diagnostics and Δ (`tab:app_outproj_diag`, `tab:app_outproj_delta`). **Per-layer**, whole-model in brackets
+- data/file: as Table 6
+- render: `python analysis/generate_tables.py --table a4` and `--table a5`
+- note: † rows are layers that exceed rank-drop 10 at 10⁻³ only under
+  whole-model pruning. Under that criterion the generator also lists
+  LLaMA-7B `l.2.o_proj` (+14 / +0, Δ +0.0%), which the PDF omits.
+
+### Table A6: synthetic factorial (`tab:synthetic`). CPU only, no model
+- data: `python experiments/synthetic_mechanism_ablation.py`
+- file: `results/synthetic/synthetic_mechanism_ablation_summary.csv` (and `_raw.csv`, `e5_part_*.csv`)
+- render: `python analysis/generate_tables.py --table a6`
+  (`--results_root results/sample` renders the committed sample)
+- runtime: ≈ 1 min for the full factorial on CPU with 8 BLAS threads (measured)
+- note: the original outputs were not kept. The committed sample comes from
+  this release's code (2026-10-18). It gives +39.6% for c = 0.40 (exact
+  0.3965), where the PDF prints +39.7%. Every other cell matches.
+
+### Table A7: layer-type comparison (`tab:app_layertype`). **Whole-model**
+- data/file: as Table 6 (`run_oproj_mechanism.py`), `summary_by_layer_type.csv`
+- render: `python analysis/generate_tables.py --table a7`
+
+### Table A8: LLaMA-7B o_proj depth profile (`tab:app_depth`). **Whole-model**
+- data/file: as Table 6, `results/oproj_mechanism/llama-7b/wanda/sp50/layer_mechanism.csv`
+- render: `python analysis/generate_tables.py --table a8`
+- note: blocks 0–2 match the PDF. The two mean rows render from the CSV as
+  3–15: 0.585 / 0.067 / −0.8 and 16–31: 0.782 / 0.098 / +1.0 (across-head /
+  ρ(M) / rank-drop). The PDF prints 0.624 / 0.066 / −0.5 and 0.783 / 0.097 / +0.8.
+  Dead heads (0/32) and Δ (0.00%) agree.
