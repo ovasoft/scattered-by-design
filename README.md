@@ -242,3 +242,8 @@ If you use the vendored pruning code, please also cite Wanda:
   journal = {arXiv preprint arXiv:2306.11695}
 }
 ```
+
+## License
+
+MIT, see `LICENSE`. The vendored `third_party/wanda/` keeps its own MIT licence
+(`third_party/wanda/LICENSE`).
